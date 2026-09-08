@@ -60,8 +60,11 @@ echo "build.sh: compiled $n bearssl objects (cached rest)"
 $CC -std=c11 -Os -ffunction-sections -fdata-sections -Wall -Wextra \
   -idirafter /usr/include \
   -I build -I build/bearssl/inc -I build/bearssl/src \
-  whisper-push.c build/obj/*.o \
-  -o build/whisper-push -static -Wl,--gc-sections
-strip build/whisper-push
-cp build/whisper-push ./whisper-push
-echo "build.sh: OK: $(stat -c%s ./whisper-push) bytes static: $(file -b ./whisper-push | cut -c1-80)"
+  transcriber.c build/obj/*.o \
+  -o build/transcriber -static -Wl,--gc-sections
+strip build/transcriber
+# policy: binaries install to ~/.local/bin ONLY, never the project root (see README.md)
+install_bin="${HOME:?}/.local/bin"
+mkdir -p "$install_bin"
+cp build/transcriber "$install_bin/transcriber"
+echo "build.sh: OK: installed $install_bin/transcriber ($(stat -c%s "$install_bin/transcriber") bytes static: $(file -b "$install_bin/transcriber" | cut -c1-80))"

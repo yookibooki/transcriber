@@ -59,7 +59,7 @@ static ssize_t write_all(int fd, const void *b, size_t n);
 static void paste_at_cursor(const char *text);
 static void eput(const char *s) { write_all(2, s, strlen(s)); }
 static void die(const char *m) {
-	eput("whisper-push: ");
+	eput("transcriber: ");
 	eput(m);
 	eput("\n");
 	exit(1);
@@ -238,10 +238,10 @@ static int mic_open(void) {
 		}
 	}
 	if (fd >= 0) {
-		eput("whisper-push: mic 48k stereo -> 16k mono\n");
+		eput("transcriber: mic 48k stereo -> 16k mono\n");
 		return fd;
 	}
-	eput("whisper-push: no usable mic (");
+	eput("transcriber: no usable mic (");
 	eput(g_alsadev);
 	eput(")\n");
 	exit(2);
@@ -695,7 +695,7 @@ static void paste_at_cursor(const char *text) {
 	}
 }
 static int do_press(int *evfds, int nev, int pcm, long long t0, uint32_t *out_len) {
-	int mfd = memfd_create("wpw", MFD_CLOEXEC);
+	int mfd = memfd_create("trb", MFD_CLOEXEC);
 	if (mfd < 0) return -1;
 	unsigned char wh[WAV_HDR_LEN];
 	wav_header(wh, 0);
@@ -771,7 +771,7 @@ static void session_drop(void) {
 		explicit_bzero(&g_sess, sizeof g_sess);
 }
 static void usage(void) {
-	eput("usage: whisper-push [--event-path /dev/input/eventX]... [--keycode N] [--alsa-dev PCM] [--help]\n");
+	eput("usage: transcriber [--event-path /dev/input/eventX]... [--keycode N] [--alsa-dev PCM] [--help]\n");
 }
 int main(int argc, char **argv) {
 	for (int i = 1; i < argc; i++) {
@@ -795,7 +795,7 @@ int main(int argc, char **argv) {
 	g_ntas = anchors_load();
 	if (g_ntas == 0) die("no trust anchors");
 	if (dns_resolve(HOST, &g_dst, &g_dstlen) != 0) die("DNS resolve api.groq.com failed (phase 0)");
-	eput("whisper-push: dns ok\n");
+	eput("transcriber: dns ok\n");
 	int pcm = mic_open();
 	int evfds[MAX_EVENTS], nev = 0;
 	if (g_nevpaths) {
@@ -808,7 +808,7 @@ int main(int argc, char **argv) {
 		nev = ev_autoscan(evfds);
 		if (!nev) die("no key-capable event device found (try --event-path)");
 	}
-	eput("whisper-push: ready\n");
+	eput("transcriber: ready\n");
 	struct pollfd pf[MAX_EVENTS];
 	for (int i = 0; i < nev; i++) {
 		pf[i].fd = evfds[i];
@@ -832,7 +832,7 @@ int main(int argc, char **argv) {
 				uint32_t wlen = 0;
 				int mfd = do_press(evfds, nev, pcm, t, &wlen);
 				if (mfd < 0) { session_drop(); continue; }
-				if (transmit(mfd, wlen) != 0) eput("whisper-push: discarded, idle\n");
+				if (transmit(mfd, wlen) != 0) eput("transcriber: discarded, idle\n");
 				close(mfd);
 				session_drop();
 			}
