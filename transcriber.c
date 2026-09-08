@@ -13,6 +13,8 @@
 #include <sys/socket.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
+#include <dirent.h>	/* DT_* constants only; enum via getdents64(2), not opendir(3) */
+#include <sys/syscall.h>
 #include <sys/random.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
@@ -32,11 +34,11 @@
 #define WAV_HDR_LEN 44
 #define RESP_MAX 8192
 #define TEXT_MAX 4096
-#define HOST "api.groq.com"
-#define PATH_EP "/openai/v1/audio/transcriptions"
-#define MODEL "whisper-large-v3-turbo"
-#define LANGUAGE "en"
 #define BOUNDARY "wzp0boundary7f3a1c9e"
+#define HOST_MAX 128
+#define MODEL_MAX 64
+#define LANG_MAX 16
+#define EPATH_MAX 192	/* endpoint path; not the libc PATH_MAX */
 #define APIKEY_MAX 512
 static const char *g_evpaths[MAX_EVENTS]; static int g_nevpaths; static int g_keycode = DEF_KEYCODE; static const char *g_alsadev = "/dev/snd/pcmC0D0c";
 static struct __attribute__((aligned(4096))) {
@@ -49,6 +51,12 @@ static struct __attribute__((aligned(4096))) {
 } g_sess;
 static char g_apikey[APIKEY_MAX];
 static size_t g_apikey_len;
+/* provider config (env-only, OpenAI-compatible /audio/transcriptions API):
+ * TRANSCRIBE_HOST / _MODEL / _LANGUAGE / _PATH / _API_KEY. TLS still trusts
+ * only anchors/ — a host whose chain doesn't terminate there fails closed. */
+static char g_host[HOST_MAX] = "api.groq.com";
+static char g_model[MODEL_MAX] = "whisper-large-v3-turbo";
+static char g_lang[LANG_MAX] = "en";static char g_epath[EPATH_MAX] = "/openai/v1/audio/transcriptions";
 static br_x509_trust_anchor g_tas[4];
 static unsigned g_ntas;
 static unsigned char g_ta_dn[4][256];
@@ -138,17 +146,34 @@ static unsigned anchors_load(void) {
 	}
 	return n;
 }
-static void key_init(void) {
-	const char *e = getenv("GROQ_API_KEY");
-	if (!e || !*e) die("GROQ_API_KEY not set in environment");
+static void cfg_str(const char *name, char *dst, size_t cap) {
+	const char *e = getenv(name);
+	if (!e || !*e) return;
 	size_t n = strlen(e);
-	if (n >= APIKEY_MAX) die("GROQ_API_KEY too long");
+	if (n >= cap) { /* fail fast at startup, not a mystery 404 later */
+		eput("transcriber: "); eput(name); eput(" too long\n");
+		exit(1);
+	}
+	memcpy(dst, e, n + 1);
+	explicit_bzero((char *)e, n); /* same hygiene as the API key */
+	unsetenv(name);
+}
+static void key_init(void) {
+	const char *e = getenv("TRANSCRIBE_API_KEY");
+	if (!e || !*e) die("TRANSCRIBE_API_KEY not set in environment");
+	size_t n = strlen(e);
+	if (n >= APIKEY_MAX) die("TRANSCRIBE_API_KEY too long");
 	memcpy(g_apikey, e, n + 1);
 	g_apikey_len = n;
 	explicit_bzero((char *)e, n);
-	unsetenv("GROQ_API_KEY");
+	unsetenv("TRANSCRIBE_API_KEY");
+	cfg_str("TRANSCRIBE_HOST", g_host, sizeof g_host);
+	cfg_str("TRANSCRIBE_MODEL", g_model, sizeof g_model);
+	cfg_str("TRANSCRIBE_LANGUAGE", g_lang, sizeof g_lang);
+	cfg_str("TRANSCRIBE_PATH", g_epath, sizeof g_epath);
 }
 static int pcm_tick_ms = 8;
+static int mic_cfg = 2; /* capture channels opened: 2 = stereo, 1 = mono */
 static int16_t conv_raw[2048];
 static int32_t conv_acc;
 static int conv_n;
@@ -168,15 +193,22 @@ static ssize_t conv_read(int pcm, int16_t *out, size_t cap, int *more) {
 	} while (r < 0 && errno == EINTR);
 	if (r <= 0) { *more = 0; return r; }
 	*more = (r == (ssize_t)sizeof conv_raw);
-	size_t frames = (size_t)r / 4;
 	size_t o = 0;
-	for (size_t i = 0; i < frames; i++)
-		o = conv_push(((int32_t)conv_raw[2*i]+(int32_t)conv_raw[2*i+1])/2, out, cap, o);
+	if (mic_cfg == 1) {
+		size_t frames = (size_t)r / 2;
+		for (size_t i = 0; i < frames; i++)
+			o = conv_push(conv_raw[i], out, cap, o);
+	} else {
+		size_t frames = (size_t)r / 4;
+		for (size_t i = 0; i < frames; i++)
+			o = conv_push(((int32_t)conv_raw[2*i]+(int32_t)conv_raw[2*i+1])/2, out, cap, o);
+	}
 	return (ssize_t)(o * 2);
 }
 static int alsa_setup(int fd) {
 	struct snd_pcm_hw_params p;
 	memset(&p, 0, sizeof p);
+	int want_ch = mic_cfg;
 	for (int i = 0; i < 3; i++)
 		for (int w = 0; w < 8; w++) p.masks[i].bits[w] = ~0u;
 	for (int i = 0; i < 12; i++) {
@@ -191,9 +223,9 @@ static int alsa_setup(int fd) {
 	p.intervals[SNDRV_PCM_HW_PARAM_SAMPLE_BITS-8].min =
 	p.intervals[SNDRV_PCM_HW_PARAM_SAMPLE_BITS-8].max = 16;
 	p.intervals[SNDRV_PCM_HW_PARAM_FRAME_BITS-8].min =
-	p.intervals[SNDRV_PCM_HW_PARAM_FRAME_BITS-8].max = 32;
+	p.intervals[SNDRV_PCM_HW_PARAM_FRAME_BITS-8].max = 16*want_ch;
 	p.intervals[SNDRV_PCM_HW_PARAM_CHANNELS-8].min =
-	p.intervals[SNDRV_PCM_HW_PARAM_CHANNELS-8].max = 2;
+	p.intervals[SNDRV_PCM_HW_PARAM_CHANNELS-8].max = want_ch;
 	p.intervals[SNDRV_PCM_HW_PARAM_RATE-8].min =
 	p.intervals[SNDRV_PCM_HW_PARAM_RATE-8].max = 48000;
 	for (int i = 0; i < 12; i++) p.intervals[i].integer = 1;
@@ -219,26 +251,55 @@ static int alsa_setup(int fd) {
 static int mic_try(const char *path) {
 	int fd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
 	if (fd < 0) return -1;
-	if (alsa_setup(fd) == 0) return fd;
+	for (int i = 0; i < 2; i++) { /* prefer stereo, fall back to mono */
+		mic_cfg = i == 0 ? 2 : 1;
+		if (alsa_setup(fd) == 0) return fd;
+		(void)ioctl(fd, SNDRV_PCM_IOCTL_DROP, 0);
+	}
 	close(fd);
+	return -1;
+}
+/* capture-PCM names under /dev/snd are pcmC<card>D<dev><c|p>; card/device
+ * numbers are per-machine, so enumerate the directory instead of a
+ * hard-coded grid */
+static int mic_scan(void) {
+	/* raw getdents64(2): opendir(3) mallocs a DIR — no heap, ever.
+	 * kernel struct linux_dirent64: u64 ino, s64 off, u16 reclen,
+	 * u8 type, char name[]; name NUL-terminated, padded to reclen. */
+	int dfd = open("/dev/snd", O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+	if (dfd < 0) return -1;
+	char buf[512];
+	for (;;) {
+		long r = syscall(SYS_getdents64, dfd, buf, sizeof buf);
+		if (r <= 0) break;
+		for (long o = 0; o < r; ) {
+			unsigned rlen;
+			memcpy(&rlen, buf + o + 16, 2); /* unaligned-safe */
+			if (!rlen || o + rlen > r) break;
+			unsigned type = (unsigned char)buf[o + 18];
+			const char *nm = buf + o + 19;
+			size_t nl = strnlen(nm, rlen - 19);
+			if (nl < rlen - 19 && nl >= 8 && nl + 10 <= 64 &&
+			    memcmp(nm, "pcm", 3) == 0 && nm[3] == 'C' &&
+			    nm[nl-1] == 'c' && type != DT_DIR) {
+				char p[64];
+				memcpy(p, "/dev/snd/", 9);
+				memcpy(p+9, nm, nl+1);
+				int fd = mic_try(p);
+				if (fd >= 0) { close(dfd); return fd; }
+			}
+			o += rlen;
+		}
+	}
+	close(dfd);
 	return -1;
 }
 static int mic_open(void) {
 	int fd = mic_try(g_alsadev);
-	if (fd < 0) {
-		for (int c = 0; c < 3 && fd < 0; c++) {
-			for (int d = 0; d < 4 && fd < 0; d++) {
-				char p[32];
-				p[0]='/';p[1]='d';p[2]='e';p[3]='v';p[4]='/';p[5]='s';p[6]='n';
-				p[7]='d';p[8]='/';p[9]='p';p[10]='c';p[11]='m';p[12]='C';
-				p[13]=(char)('0'+c);p[14]='D';p[15]=(char)('0'+d);p[16]='c';p[17]=0;
-				if (!strcmp(p, g_alsadev)) continue;
-				fd = mic_try(p);
-			}
-		}
-	}
+	if (fd < 0) fd = mic_scan();
 	if (fd >= 0) {
-		eput("transcriber: mic 48k stereo -> 16k mono\n");
+		eput(mic_cfg == 2 ? "transcriber: mic 48k stereo -> 16k mono\n"
+		                  : "transcriber: mic 48k mono -> 16k mono\n");
 		return fd;
 	}
 	eput("transcriber: no usable mic (");
@@ -319,31 +380,44 @@ static int dns_skip(const unsigned char *m, size_t n, int off) {
 	}
 	return -1;
 }
-static int dns_resolve(const char *host, struct sockaddr_storage *dst, socklen_t *dstlen) {
-	struct sockaddr_in ns;
-	memset(&ns, 0, sizeof ns);
-	ns.sin_family = AF_INET;
-	ns.sin_port = htons(53);
+/* all IPv4 nameservers from /etc/resolv.conf, in order; no hard-coded
+ * fallback resolver (the old 127.0.0.53 default only works with
+ * systemd-resolved's stub listener) */
+static int dns_nameservers(struct sockaddr_in *out, int max) {
 	int f = open("/etc/resolv.conf", O_RDONLY|O_CLOEXEC);
-	if (f >= 0) {
-		char rb[512];
-		ssize_t r = read(f, rb, sizeof rb-1);
-		close(f);
-		if (r > 0) {
-			rb[r] = 0;
-			char *ns0 = strstr(rb, "nameserver ");
-			if (ns0) {
-				ns0 += 11;
-				while (*ns0 == ' ' || *ns0 == '\t') ns0++;
-				char *e = ns0;
-				while (*e && *e != ' ' && *e != '\t' && *e != '\n') e++;
-				char sv = *e;
-				*e = 0;
-				if (inet_pton(AF_INET, ns0, &ns.sin_addr) != 1) ns.sin_addr.s_addr = htonl(0x7F000035);
-				*e = sv;
-			} else ns.sin_addr.s_addr = htonl(0x7F000035);
-		} else ns.sin_addr.s_addr = htonl(0x7F000035);
-	} else ns.sin_addr.s_addr = htonl(0x7F000035);
+	if (f < 0) return 0;
+	char rb[2048];
+	ssize_t r = read(f, rb, sizeof rb-1);
+	close(f);
+	if (r <= 0) return 0;
+	rb[r] = 0;
+	int n = 0;
+	for (char *ln = rb; ln && n < max; ) {
+		char *eol = strchr(ln, '\n');
+		if (eol) *eol = 0;
+		while (*ln == ' ' || *ln == '\t') ln++;
+		if (strncmp(ln, "nameserver", 10) == 0 && (ln[10] == ' ' || ln[10] == '\t')) {
+			ln += 11;
+			while (*ln == ' ' || *ln == '\t') ln++;
+			char *e = ln;
+			while (*e && *e != ' ' && *e != '\t') e++;
+			char sv = *e;
+			*e = 0;
+			if (inet_pton(AF_INET, ln, &out[n].sin_addr) == 1) {
+				out[n].sin_family = AF_INET;
+				out[n].sin_port = htons(53);
+				n++;
+			}
+			*e = sv;
+		}
+		ln = eol ? eol+1 : 0;
+	}
+	return n;
+}
+static int dns_resolve(const char *host, struct sockaddr_storage *dst, socklen_t *dstlen) {
+	struct sockaddr_in ns4[4];
+	int nns = dns_nameservers(ns4, 4);
+	if (nns <= 0) return -1;
 	unsigned char q[512], a[512];
 	memset(q, 0, 12);
 	uint16_t id = 0;
@@ -370,8 +444,9 @@ static int dns_resolve(const char *host, struct sockaddr_storage *dst, socklen_t
 	if (so < 0) return -1;
 	struct pollfd pf = { so, POLLOUT, 0 };
 	for (int at = 0; at < 2; at++) {
+	  for (int k = 0; k < nns; k++) {
 		if (poll(&pf, 1, 2500) <= 0) continue;
-		if (sendto(so, q, ql, 0, (struct sockaddr *)&ns, sizeof ns) != (ssize_t)ql) continue;
+		if (sendto(so, q, ql, 0, (struct sockaddr *)&ns4[k], sizeof ns4[k]) != (ssize_t)ql) continue;
 		pf.events = POLLIN;
 		if (poll(&pf, 1, 2500) <= 0) { pf.events = POLLOUT; continue; }
 		ssize_t rl = recv(so, a, sizeof a, 0);
@@ -399,6 +474,7 @@ static int dns_resolve(const char *host, struct sockaddr_storage *dst, socklen_t
 			}
 			off += dl;
 		}
+	  }
 	}
 	close(so);
 	return -1;
@@ -568,13 +644,36 @@ static ssize_t tls_read_all(br_ssl_client_context *sc, int fd, char *out, size_t
 	out[off] = 0;
 	return (ssize_t)off;
 }
-static const char part1_head[] = "--" BOUNDARY "\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n" MODEL "\r\n--" BOUNDARY "\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\n" LANGUAGE "\r\n--" BOUNDARY "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\nContent-Type: audio/wav\r\n\r\n";
 static const char part_tail[] = "\r\n--" BOUNDARY "--\r\n";
+static char part1_head[512];
+static size_t part1_len;
+static int tx_build_parts(void) {
+	char *p = part1_head;
+	char *end = part1_head + sizeof part1_head;
+	char *put = p;
+	#define PSTR(s) do { size_t L = sizeof(s)-1; if (put + L > end) return -1; \
+		memcpy(put, s, L); put += L; } while (0)
+	#define PBUF(b) do { size_t L = strlen(b); if (put + L > end) return -1; \
+		memcpy(put, b, L); put += L; } while (0)
+	PSTR("--" BOUNDARY "\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n");
+	PBUF(g_model);
+	PSTR("\r\n--" BOUNDARY "\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\n");
+	PBUF(g_lang);
+	PSTR("\r\n--" BOUNDARY "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\nContent-Type: audio/wav\r\n\r\n");
+	#undef PSTR
+	#undef PBUF
+	part1_len = (size_t)(put - p);
+	return 0;
+}
 static int transmit(int mfd, uint32_t wav_data_len) {
 	uint32_t wav_total = WAV_HDR_LEN + wav_data_len;
-	unsigned long long body_len = (unsigned long long)(sizeof part1_head-1)+wav_total+(sizeof part_tail-1);
-	char req[1024], *rp;
-	rp = app_str(req, "POST " PATH_EP " HTTP/1.1\r\nHost: " HOST "\r\nAuthorization: Bearer ");
+	unsigned long long body_len = (unsigned long long)part1_len+wav_total+(sizeof part_tail-1);
+	char req[2048], *rp;
+	rp = app_str(req, "POST ");
+	rp = app_str(rp, g_epath);
+	rp = app_str(rp, " HTTP/1.1\r\nHost: ");
+	rp = app_str(rp, g_host);
+	rp = app_str(rp, "\r\nAuthorization: Bearer ");
 	rp = app_str(rp, g_apikey);
 	rp = app_str(rp, "\r\nContent-Type: multipart/form-data; boundary=" BOUNDARY "\r\nContent-Length: ");
 	rp = app_u64(rp, body_len);
@@ -597,7 +696,7 @@ static int transmit(int mfd, uint32_t wav_data_len) {
 		return -1;
 	}
 	fcntl(fd, F_SETFL, fl);
-	tls_profile_init(HOST);
+	tls_profile_init(g_host);
 	if (br_ssl_engine_current_state(&g_sess.sc.eng) & BR_SSL_CLOSED) {
 		close(fd);
 		return -1;
@@ -608,7 +707,7 @@ static int transmit(int mfd, uint32_t wav_data_len) {
 		return -1;
 	}
 	if (tls_send_all(&g_sess.sc, fd, (unsigned char *)req, rl, until) != 0 ||
-	    tls_send_all(&g_sess.sc, fd, (unsigned char *)part1_head, sizeof part1_head-1, until) != 0) {
+	    tls_send_all(&g_sess.sc, fd, (unsigned char *)part1_head, part1_len, until) != 0) {
 		close(fd);
 		return -1;
 	}
@@ -652,7 +751,33 @@ static int transmit(int mfd, uint32_t wav_data_len) {
 	paste_at_cursor(g_sess.tout);
 	return 0;
 }
+static int on_path(const char *name) {
+	const char *pv = getenv("PATH");
+	if (!pv || !*pv) pv = "/usr/bin:/bin";
+	size_t nl = strlen(name);
+	const char *s = pv;
+	for (;;) {
+		const char *e = strchr(s, ':');
+		size_t dl = e ? (size_t)(e-s) : strlen(s);
+		if (dl && dl + nl + 2 <= 256) {
+			char p[256];
+			memcpy(p, s, dl); p[dl] = '/';
+			memcpy(p+dl+1, name, nl+1);
+			if (access(p, X_OK) == 0) return 1;
+		}
+		if (!e) break;
+		s = e+1;
+	}
+	return 0;
+}
 static void paste_at_cursor(const char *text) {
+	/* xclip/xdotool are X11-only; skip paste under Wayland or when the
+	 * helpers are not on PATH, instead of silently typing nothing */
+	if (!on_path("xclip") || !on_path("xdotool") ||
+	    (getenv("WAYLAND_DISPLAY") && !getenv("DISPLAY"))) {
+		eput("transcriber: paste skipped (X11-only helpers)\n");
+		return;
+	}
 	pid_t p = fork();
 	if (p != 0) {
 		if (p > 0) {
@@ -794,8 +919,9 @@ int main(int argc, char **argv) {
 	key_init();
 	g_ntas = anchors_load();
 	if (g_ntas == 0) die("no trust anchors");
-	if (dns_resolve(HOST, &g_dst, &g_dstlen) != 0) die("DNS resolve api.groq.com failed (phase 0)");
+	if (dns_resolve(g_host, &g_dst, &g_dstlen) != 0) { eput("transcriber: DNS resolve failed (phase 0): "); eput(g_host); eput("\n"); return 1; }
 	eput("transcriber: dns ok\n");
+	if (tx_build_parts() != 0) die("provider config too long");
 	int pcm = mic_open();
 	int evfds[MAX_EVENTS], nev = 0;
 	if (g_nevpaths) {
@@ -817,10 +943,25 @@ int main(int argc, char **argv) {
 	for (;;) {
 		if (poll(pf, (nfds_t)nev, -1) < 0) {
 			if (errno == EINTR) continue;
-			die("poll failed");
+			/* runtime failure: never exit — report, wait, retry */
+			eput("transcriber: poll failed, retrying\n");
+			struct timespec ts = { 1, 0 };
+			nanosleep(&ts, 0);
+			continue;
 		}
 		for (int i = 0; i < nev; i++) {
-			if (pf[i].revents & (POLLERR|POLLHUP|POLLNVAL)) die("input device went away");
+			if (pf[i].revents & (POLLERR|POLLHUP|POLLNVAL)) {
+				/* device vanished: drop it, rescan; never exit */
+				eput("transcriber: input device lost, rescanning\n");
+				close(evfds[i]);
+				for (int j = i; j + 1 < nev; j++) {
+					evfds[j] = evfds[j+1];
+					pf[j] = pf[j+1];
+				}
+				nev--;
+				i--;
+				continue;
+			}
 			if (!(pf[i].revents & POLLIN)) continue;
 			struct input_event ev;
 			ssize_t r;
@@ -835,6 +976,28 @@ int main(int argc, char **argv) {
 				if (transmit(mfd, wlen) != 0) eput("transcriber: discarded, idle\n");
 				close(mfd);
 				session_drop();
+			}
+		}
+		if (nev == 0) {
+			/* all inputs gone: reopen explicit paths or rescan, forever */
+			while (nev == 0) {
+				if (g_nevpaths) {
+					for (int k = 0; k < g_nevpaths; k++) {
+						int fd = ev_open_grab(g_evpaths[k]);
+						if (fd >= 0) evfds[nev++] = fd;
+					}
+				} else {
+					nev = ev_autoscan(evfds);
+				}
+				if (nev == 0) {
+					struct timespec ts = { 1, 0 };
+					nanosleep(&ts, 0);
+				}
+			}
+			eput("transcriber: input recovered\n");
+			for (int i = 0; i < nev; i++) {
+				pf[i].fd = evfds[i];
+				pf[i].events = POLLIN;
 			}
 		}
 	}

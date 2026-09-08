@@ -7,6 +7,12 @@ BEAR_SHA256="6705bba1714961b41a728dfc5debbe348d2966c117649392f8c8139efc83ff14"
 CC="${CC:-musl-gcc}"
 need() { command -v "$1" >/dev/null 2>&1 || { echo "build.sh: need $1" >&2; exit 1; }; }
 need "$CC"; need openssl; need strip; need python3
+# used later: curl/tar (only when downloading), sha256sum -c (digest verify),
+# stat -c%s and file -b (final report line) — GNU coreutils assumptions
+need sha256sum; need stat; need file; need cut
+if [ ! -d build/bearssl ]; then
+  need curl; need tar
+fi
 mkdir -p build
 if [ ! -d build/bearssl ]; then
   if [ ! -f build/bearssl.tar.gz ]; then
@@ -66,5 +72,9 @@ strip build/transcriber
 # policy: binaries install to ~/.local/bin ONLY, never the project root (see README.md)
 install_bin="${HOME:?}/.local/bin"
 mkdir -p "$install_bin"
-cp build/transcriber "$install_bin/transcriber"
+# atomic replace: a plain `cp` onto the destination fails with ETXTBSY while
+# the daemon is running; rename(2) over a running binary is allowed (the
+# old process keeps its inode) and the new file takes effect on restart.
+cp build/transcriber "$install_bin/transcriber.new"
+mv -f "$install_bin/transcriber.new" "$install_bin/transcriber"
 echo "build.sh: OK: installed $install_bin/transcriber ($(stat -c%s "$install_bin/transcriber") bytes static: $(file -b "$install_bin/transcriber" | cut -c1-80))"
