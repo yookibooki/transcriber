@@ -1,8 +1,7 @@
 # AGENTS
 
 ## Project
-Single-file push-to-talk daemon (`transcriber.c`): hold Right Ctrl, speak → transcript at cursor + stdout.
-Any distro; dev box = test target, not template.
+Single-file push-to-talk daemon (`transcriber.c`): hold Right Ctrl, speak → transcript at the cursor.
 
 Goal: simplest solution that just works.
 Philosophy: extreme efficiency, idiomatic C — minimal RAM / binary / LOC / syscalls.

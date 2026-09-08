@@ -695,10 +695,6 @@ static int transmit(int mfd, uint32_t wav_data_len) {
 	body += 4;
 	size_t blen = (size_t)rl2 - (size_t)(body - g_sess.resp);
 	if (json_get_text(body, blen, g_sess.tout, sizeof g_sess.tout) < 0) goto fail;
-	size_t tl = strlen(g_sess.tout);
-	if (write_all(1, g_sess.tout, tl) < 0) return -1;
-	if (tl == 0 || g_sess.tout[tl-1] != '\n')
-		if (write_all(1, "\n", 1) < 0) return -1;
 	paste_at_cursor(g_sess.tout);
 	return 0;
 fail:

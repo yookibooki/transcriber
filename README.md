@@ -1,12 +1,12 @@
 # transcriber
 
-Single-file, statically-linked C push-to-talk daemon: hold Right Ctrl, speak, release — audio is recorded, WAV POSTed to Groq's `whisper-large-v3-turbo` over TLS 1.2 (own stack, pinned anchors), and the transcript is pasted at the cursor and echoed to stdout.
+Single-file, statically-linked C push-to-talk daemon: hold Right Ctrl, speak, release — audio is recorded, WAV POSTed to Groq's `whisper-large-v3-turbo` over TLS 1.2 (own stack, pinned anchors), and the transcript is pasted at the cursor.
 
 ## Files
 
 | Path | What |
 |---|---|
-| `transcriber.c` | Whole tool (985 LOC, no heap, no libc TLS stack) |
+| `transcriber.c` | Whole tool (981 LOC, no heap, no libc TLS stack) |
 | `build.sh` | Build: compiles BearSSL + its `brssl` tool (generates the anchor table), links static, installs to `~/.local/bin/transcriber` |
 | `anchors/*.pem` | Pinned trust anchors for `api.groq.com`: ISRG Root X1/X2 (Let's Encrypt), GTS Root R4 (Google) — compiled into a const `br_x509_trust_anchor` table (`build/ta.h`) at build time by the vendored `brssl`; the daemon does no anchor ASN.1 decode |
 | `build/` | Build cache/artifacts — gitignored |
@@ -50,7 +50,7 @@ Runtime deps: paste needs `xclip` + `xdotool` on PATH (X11; skipped when the ses
 - After each send, the request buffer (which contains the API key) is zeroed, and session memory (`g_sess`: TLS state, keys, transcript buffers) is wiped via `madvise(MADV_DONTNEED)`; `sizeof g_sess` is compile-time asserted to be a page multiple so the wipe stays exact.
 - Own DNS (raw UDP to all IPv4 nameservers in resolv.conf, in order) and own TLS 1.2 client (ECDHE AES-GCM suites only, pinned anchors as a compiled-in table — never a system store). TLS session-ID resumption keeps the handshake state between sends (user-approved): repeat dictations do an abbreviated handshake; if the server refuses, it falls back to a full handshake automatically.
 - The daemon never exits at runtime: poll errors retry after 1s, dead input devices are dropped/re-scanned, record failures discard the capture silently. A rejected send logs one line: `transcriber: HTTP 429` (server status) or `transcriber: send failed` (transport). Exit codes 1 (bad env/DNS, stray arguments) and 2 (no mic) are startup-only fail-fast; the anchor table is a build-time artifact, so it cannot fail at runtime.
-- Transcript goes to stdout and cursor-paste both.
+- Transcript is delivered only by cursor-paste (stdout is never written; on a per-send basis journald must not hold your dictations).
 
 ## Autostart (systemd user service)
 
