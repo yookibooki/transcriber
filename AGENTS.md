@@ -11,27 +11,8 @@ Single-file push-to-talk daemon (transcriber.c): hold Right Ctrl, speak → tran
 ```
 musl-gcc only. First run downloads pinned BearSSL 0.6. Installs to ~/.local/bin/transcriber.
 
-## Provider
-Env-only, read at startup: TRANSCRIBE_API_KEY (required); TRANSCRIBE_HOST/MODEL/LANGUAGE/PATH (Groq defaults). OpenAI-compatible /audio/transcriptions; switch = edit env + restart. Trust = build-time anchors/ only, never a system store; new root → add .pem + rebuild (ask-first).
-
-## Definition of done
-| Metric | PASS | Measure |
-|---|---|---|
-| Idle CPU | <5 wakeups/s | /proc ctxt delta (10s) |
-| Idle Memory | <200KB | VmRSS |
-| Rec CPU | <2% 1-core | /proc/<pid>/stat utime+stime over a hold |
-| Binary | <200KB stripped | stat -c%s installed |
-| LOC | <1100 soft | wc -l transcriber.c |
-
 ## Tests
 Agents run no tests (tools/ = measurement rigs). Build, hand over, report changes; never claim PASS.
-
-## Code rules
-- transcriber.c only: C11, tabs, no heap, all error paths handled; tools/ = dep-free python rigs, local-only (untracked, never pushed).
-- Never exit at runtime: poll errors retry 1s; lost inputs rescan; failures log `discarded, idle`. Exit 1 (env/DNS), 2 (no mic): startup-only.
-- No hardcoded device numbers, distro paths/packages, fallback DNS.
-- TRANSCRIBE_API_KEY read once, zeroed, unset; g_sess madvise(DONTNEED)-wiped after send. Never weaken security/pinning to pass a build.
-- Unsupported env (Wayland paste, IPv6 resolv.conf): skip + flag.
 
 ## Do not
 Commit build/ or gitignored tools/ (force-adding it defeats the policy); install outside ~/.local/bin; hand-edit build/anchors.h.

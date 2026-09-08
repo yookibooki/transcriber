@@ -1,6 +1,6 @@
 # transcriber
 
-Single-file, statically-linked C push-to-talk daemon: hold a key (default Right Ctrl), speak, release — audio is recorded, WAV POSTed to Groq's `whisper-large-v3-turbo` over TLS 1.2 (own stack, pinned anchors), and the transcript is pasted at the cursor and echoed to stdout.
+Single-file, statically-linked C push-to-talk daemon: hold Right Ctrl, speak, release — audio is recorded, WAV POSTed to Groq's `whisper-large-v3-turbo` over TLS 1.2 (own stack, pinned anchors), and the transcript is pasted at the cursor and echoed to stdout.
 
 ## Files
 
@@ -38,18 +38,20 @@ Env config (env-only; no provider flags). Defaults in parens:
 
 Any OpenAI-compatible `/audio/transcriptions` endpoint works without recompile. TLS still trusts **only `anchors/`** — a provider whose chain terminates elsewhere handshake-fails by design; adding a root to `anchors/` is a trust-policy change (ask-first).
 
-Flags: `--event-path /dev/input/eventX` (repeatable), `--keycode N` (default 97 = Right Ctrl), `--alsa-dev /dev/snd/pcmC0D0c` (defaults first, then any `pcmC*D*c` under `/dev/snd`), `--help`.
+Flags: `--event-path /dev/input/eventX` (repeatable), `--alsa-dev /dev/snd/pcmC0D0c` (defaults first, then any `pcmC*D*c` under `/dev/snd`), `--help`. Right Ctrl is the only hotkey — there is no keycode option.
 
-Runtime deps: paste needs `xclip` + `xdotool` on PATH (X11; skipped under Wayland-only); `/dev/input/` + `/dev/snd/` access (input + audio groups or root); DNS from `/etc/resolv.conf`.
+Runtime deps: paste needs `xclip` + `xdotool` on PATH (X11; skipped when the session is Wayland, incl. `XDG_SESSION_TYPE=wayland`); `/dev/input/` + `/dev/snd/` access (input + audio groups or root); DNS from `/etc/resolv.conf`.
 
 ## Behavior
 
 - Mic opens 48 kHz stereo S16 LE (mono fallback), downsampled 3:1 to 16 kHz mono WAV in-code; ring buffer of 2 halves × 2048 samples.
 - Hold < 300 ms: ignored, no network. Cap 60 s per press. HTTP response cap 8 KB; transcript cap 4 KB.
 - No `EVIOCGRAB` — keyboard stays fully usable.
-- Own DNS (raw UDP to all IPv4 nameservers in resolv.conf, in order) and own TLS 1.2 client (ECDHE AES-GCM suites only, pinned anchors — never a system store).
+- Clipboard paste: only after `xclip -o` confirms the transcript is actually served (up to 2 s, then skip) — replaces a fixed 50 ms race. Clipboard content is still overwritten by design.
+- After each send, the request buffer (which contains the API key) is zeroed, and session memory (`g_sess`: TLS state, keys, transcript buffers) is wiped via `madvise(MADV_DONTNEED)`; `sizeof g_sess` is compile-time asserted to be a page multiple so the wipe stays exact.
+- Own DNS (raw UDP to all IPv4 nameservers in resolv.conf, in order) and own TLS 1.2 client (ECDHE AES-GCM suites only, pinned anchors — never a system store). TLS session-ID resumption keeps the handshake state between sends (user-approved): repeat dictations do an abbreviated handshake; if the server refuses, it falls back to a full handshake automatically.
 - After each send, session memory (`g_sess`: TLS state, keys, transcript buffers) is wiped via `madvise(MADV_DONTNEED)`.
-- The daemon never exits at runtime: poll errors retry after 1s, dead input devices are dropped/re-scanned, record failures discard the capture and print `transcriber: discarded, idle` on stderr. Exit codes 1 (bad env/anchors/DNS) and 2 (no mic) are startup-only fail-fast.
+- The daemon never exits at runtime: poll errors retry after 1s, dead input devices are dropped/re-scanned, record failures discard the capture silently. A rejected send logs one line: `transcriber: HTTP 429` (server status) or `transcriber: send failed` (transport). Exit codes 1 (bad env/anchors/DNS) and 2 (no mic) are startup-only fail-fast.
 - Transcript goes to stdout and cursor-paste both.
 
 ## Autostart (systemd user service)
@@ -71,7 +73,7 @@ journalctl --user -u transcriber.service -f      # logs: "dns ok", "mic ...", "r
 | Binary | <200KB stripped |
 | LOC | <1100, soft limit |
 
-Measured on the 2026-09-08 build: 0 context switches over 10 s idle, RSS 144 kB, binary 112,288 bytes stripped static, 1,005 LOC.
+Measured on the 2026-09-08 build: 0 context switches over 10 s idle, RSS 144 kB, binary 112,288 bytes stripped static, 1,005 LOC. Rebuilt after the 2026-09-08 review fixes (single-page wipe assertion, right-ctrl-only, tls pump de-dup, paste confirmation): 112,280 bytes, 1,036 LOC. Idle/rec-CPU/memory not re-measured — rigs are local-only.
 
 ## History
 

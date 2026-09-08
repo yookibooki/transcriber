@@ -18,16 +18,16 @@
 #include <sys/random.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <linux/input.h>
 #include <sound/asound.h>
 #include <bearssl.h>
-#define DEF_KEYCODE 97
+#include "anchors.h"	/* generated at build time from anchors/ */
 #define MAX_EVENTS 8
 #define SAMPLE_RATE 16000
 #define CHANNELS 1
-#define HALF_SAMPLES 2048
-#define RING_HALVES 2
+#define PCM_SAMPLES 2048
 #define PRESS_MIN_MS 300
 #define PRESS_MAX_MS 60000
 #define MAX_WAV_DATA (60u*16000u*2u)
@@ -40,21 +40,39 @@
 #define LANG_MAX 16
 #define EPATH_MAX 192	/* endpoint path; not the libc PATH_MAX */
 #define APIKEY_MAX 512
-static const char *g_evpaths[MAX_EVENTS]; static int g_nevpaths; static int g_keycode = DEF_KEYCODE; static const char *g_alsadev = "/dev/snd/pcmC0D0c";
-static struct __attribute__((aligned(4096))) {
+static const char *g_evpaths[MAX_EVENTS];
+static int g_nevpaths;
+static const char *g_alsadev = "/dev/snd/pcmC0D0c";
+/* Right Ctrl is the only hotkey; no option exists to change it */
+static const int g_keycode = KEY_RIGHTCTRL;
+static struct __attribute__((aligned(4096))) session {
 	br_ssl_client_context sc;
 	br_x509_minimal_context xc;
 	unsigned char tlsbuf[BR_SSL_BUFSIZE_BIDI];
 	char resp[RESP_MAX];
 	char tout[TEXT_MAX];
-	int16_t ring[RING_HALVES][HALF_SAMPLES];
+	int16_t pcmbuf[PCM_SAMPLES];
 } g_sess;
+/* MADV_DONTNEED rounds the length up to whole pages: g_sess must occupy an
+ * exact page multiple or the wipe after each send would also zero the
+ * globals that follow it in .bss (g_nevpaths etc.) */
+_Static_assert(sizeof g_sess % 4096 == 0, "g_sess must be a page multiple");
 static char g_apikey[APIKEY_MAX];
 static size_t g_apikey_len;
+/* TLS session-ID resumption (user-approved 2026-09-09): the master secret
+ * (48 bytes) deliberately survives between sends so each dictation can do
+ * an abbreviated handshake instead of a full ECDHE exchange (~1 RTT + key
+ * agreement saved). It lives OUTSIDE g_sess so the page-wide wipe after
+ * each send still covers the engine, transcript and buffers. Server may
+ * refuse resumption: BearSSL then falls back to a full handshake silently.
+ * Note TLS 1.2 resumption does not re-transmit the certificate: identity
+ * is bound to the pinned-anchor-authenticated session that minted it. */
+static br_ssl_session_parameters g_tls_sess;
+static unsigned g_tls_sess_valid;
+static char g_host[HOST_MAX] = "api.groq.com";
 /* provider config (env-only, OpenAI-compatible /audio/transcriptions API):
  * TRANSCRIBE_HOST / _MODEL / _LANGUAGE / _PATH / _API_KEY. TLS still trusts
  * only anchors/ — a host whose chain doesn't terminate there fails closed. */
-static char g_host[HOST_MAX] = "api.groq.com";
 static char g_model[MODEL_MAX] = "whisper-large-v3-turbo";
 static char g_lang[LANG_MAX] = "en";static char g_epath[EPATH_MAX] = "/openai/v1/audio/transcriptions";
 static br_x509_trust_anchor g_tas[4];
@@ -101,7 +119,6 @@ static ssize_t write_all(int fd, const void *b, size_t n) {
 	}
 	return (ssize_t)off;
 }
-#include "anchors.h"
 struct dn_acc { unsigned char *dst; size_t cap, len; };
 static void dn_append(void *ctx, const void *buf, size_t len) {
 	struct dn_acc *a = ctx;
@@ -308,7 +325,7 @@ static int mic_open(void) {
 	exit(2);
 	return -1;
 }
-static int ev_open_grab(const char *path) {
+static int ev_open(const char *path) {
 	int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
 	if (fd < 0) return -1;
 	/* no EVIOCGRAB: exclusive grab swallows all typing on USB/laptop kbd */
@@ -323,7 +340,9 @@ static int ev_autoscan(int *fds) {
 		*pe = 0;
 		int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
 		if (fd < 0) continue;
-		unsigned long bits[8] = { 0 };
+		/* KEY_MAX = 0x2ff: bitmap must cover the whole keycode space, not
+		 * just 512 bits, or g_keycode indexing reads past the array */
+		unsigned long bits[(KEY_MAX + 1 + 7) / 8 / sizeof(long)] = { 0 };
 		if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof bits), bits) < 0) {
 			close(fd);
 			continue;
@@ -367,7 +386,9 @@ static void tls_profile_init(const char *host) {
 	br_ssl_engine_set_ecdsa(&g_sess.sc.eng, br_ecdsa_i31_vrfy_asn1);
 	br_ssl_engine_set_x509(&g_sess.sc.eng, &g_sess.xc.vtable);
 	br_ssl_engine_set_buffer(&g_sess.sc.eng, g_sess.tlsbuf, sizeof g_sess.tlsbuf, 1);
-	br_ssl_client_reset(&g_sess.sc, host, 0);
+	if (g_tls_sess_valid)
+		br_ssl_engine_set_session_parameters(&g_sess.sc.eng, &g_tls_sess);
+	br_ssl_client_reset(&g_sess.sc, host, g_tls_sess_valid);
 }
 static uint16_t rd16(const unsigned char *p) { return (uint16_t)((p[0]<<8)|p[1]); }
 static int dns_skip(const unsigned char *m, size_t n, int off) {
@@ -540,106 +561,81 @@ static int tls_poll(int fd, short ev, int timeout_ms) {
 	if (p.revents & (POLLERR|POLLHUP|POLLNVAL)) return -1;
 	return 0;
 }
-static int tls_handshake(br_ssl_client_context *sc, int fd, long long until) {
-	for (;;) {
-		unsigned st = br_ssl_engine_current_state(&sc->eng);
-		size_t n = 0;
-		unsigned char *b;
-		if (st & BR_SSL_CLOSED) return -1;
-		if (st & (BR_SSL_SENDAPP|BR_SSL_RECVAPP)) return 0;
-		long long left = until - now_ms();
-		if (left <= 0) return -1;
-		if (st & BR_SSL_SENDREC) {
-			b = br_ssl_engine_sendrec_buf(&sc->eng, &n);
-			if (n == 0) return -1;
-			if (tls_poll(fd, POLLOUT, (int)left) != 0) return -1;
-			ssize_t w = send(fd, b, n, MSG_NOSIGNAL);
-			if (w <= 0) return -1;
-			br_ssl_engine_sendrec_ack(&sc->eng, (size_t)w);
-		} else {
-			b = br_ssl_engine_recvrec_buf(&sc->eng, &n);
-			if (n == 0) return -1;
-			if (tls_poll(fd, POLLIN, (int)left) != 0) return -1;
-			ssize_t r = recv(fd, b, n, 0);
-			if (r <= 0) return -1;
-			br_ssl_engine_recvrec_ack(&sc->eng, (size_t)r);
-		}
-	}
-}
-static int tls_send_all(br_ssl_client_context *sc, int fd, const unsigned char *p, size_t n, long long until) {
-	size_t off = 0;
-	while (off < n) {
-		unsigned st = br_ssl_engine_current_state(&sc->eng);
-		size_t m = 0;
-		unsigned char *b;
-		if (st & BR_SSL_CLOSED) return -1;
-		if (st & BR_SSL_SENDREC) {
-			b = br_ssl_engine_sendrec_buf(&sc->eng, &m);
-			if (m == 0) return -1;
-			long long left = until - now_ms();
-			if (left <= 0 || tls_poll(fd, POLLOUT, (int)left) != 0) return -1;
-			ssize_t w = send(fd, b, m, MSG_NOSIGNAL);
-			if (w <= 0) return -1;
-			br_ssl_engine_sendrec_ack(&sc->eng, (size_t)w);
-			continue;
-		}
-		if (st & BR_SSL_SENDAPP) {
-			b = br_ssl_engine_sendapp_buf(&sc->eng, &m);
-			if (m == 0) return -1;
-			size_t w = n - off < m ? n - off : m;
-			memcpy(b, p + off, w);
-			br_ssl_engine_sendapp_ack(&sc->eng, w);
-			br_ssl_engine_flush(&sc->eng, 0);
-			off += w;
-			continue;
-		}
-		b = br_ssl_engine_recvrec_buf(&sc->eng, &m);
-		if (m == 0) return -1;
-		{
-			long long left = until - now_ms();
-			if (left <= 0 || tls_poll(fd, POLLIN, (int)left) != 0) return -1;
-			ssize_t r = recv(fd, b, m, 0);
-			if (r <= 0) return -1;
-			br_ssl_engine_recvrec_ack(&sc->eng, (size_t)r);
-		}
+static int tls_pump(br_ssl_engine_context *eng, int fd, short ev, long long until) {
+	size_t n = 0;
+	unsigned char *b;
+	long long left = until - now_ms();
+	if (left <= 0) return -1;
+	if (ev == POLLOUT) {
+		b = br_ssl_engine_sendrec_buf(eng, &n);
+		if (n == 0) return -1;
+		if (tls_poll(fd, POLLOUT, (int)left) != 0) return -1;
+		ssize_t w = send(fd, b, n, MSG_NOSIGNAL);
+		if (w <= 0) return -1;
+		br_ssl_engine_sendrec_ack(eng, (size_t)w);
+	} else {
+		b = br_ssl_engine_recvrec_buf(eng, &n);
+		if (n == 0) return -1;
+		if (tls_poll(fd, POLLIN, (int)left) != 0) return -1;
+		ssize_t r = recv(fd, b, n, 0);
+		if (r <= 0) return -1;
+		br_ssl_engine_recvrec_ack(eng, (size_t)r);
 	}
 	return 0;
 }
-static ssize_t tls_read_all(br_ssl_client_context *sc, int fd, char *out, size_t cap, long long until) {
+static int tls_handshake(br_ssl_engine_context *eng, int fd, long long until) {
+	for (;;) {
+		unsigned st = br_ssl_engine_current_state(eng);
+		if (st & BR_SSL_CLOSED) return -1;
+		if (st & (BR_SSL_SENDAPP|BR_SSL_RECVAPP)) return 0;
+		if (tls_pump(eng, fd, (st & BR_SSL_SENDREC) ? POLLOUT : POLLIN, until) != 0)
+			return -1;
+	}
+}
+static int tls_send_all(br_ssl_engine_context *eng, int fd, const unsigned char *p, size_t n, long long until) {
+	size_t off = 0;
+	while (off < n) {
+		unsigned st = br_ssl_engine_current_state(eng);
+		if (st & BR_SSL_CLOSED) return -1;
+		if (st & BR_SSL_SENDREC) {
+			if (tls_pump(eng, fd, POLLOUT, until) != 0) return -1;
+			continue;
+		}
+		if (st & BR_SSL_SENDAPP) {
+			size_t m = 0;
+			unsigned char *b = br_ssl_engine_sendapp_buf(eng, &m);
+			if (m == 0) return -1;
+			size_t w = n - off < m ? n - off : m;
+			memcpy(b, p + off, w);
+			br_ssl_engine_sendapp_ack(eng, w);
+			br_ssl_engine_flush(eng, 0);
+			off += w;
+			continue;
+		}
+		if (tls_pump(eng, fd, POLLIN, until) != 0) return -1;
+	}
+	return 0;
+}
+static ssize_t tls_read_all(br_ssl_engine_context *eng, int fd, char *out, size_t cap, long long until) {
 	size_t off = 0;
 	while (off + 1 < cap) {
-		unsigned st = br_ssl_engine_current_state(&sc->eng);
-		size_t m = 0;
-		unsigned char *b;
+		unsigned st = br_ssl_engine_current_state(eng);
 		if (st & BR_SSL_RECVAPP) {
-			b = br_ssl_engine_recvapp_buf(&sc->eng, &m);
+			size_t m = 0;
+			unsigned char *b = br_ssl_engine_recvapp_buf(eng, &m);
 			if (m == 0) break;
 			size_t w = off + m > cap - 1 ? cap - 1 - off : m;
 			memcpy(out + off, b, w);
 			off += w;
-			br_ssl_engine_recvapp_ack(&sc->eng, m);
+			br_ssl_engine_recvapp_ack(eng, m);
 			continue;
 		}
 		if (st & BR_SSL_CLOSED) break;
 		if (st & BR_SSL_SENDREC) {
-			b = br_ssl_engine_sendrec_buf(&sc->eng, &m);
-			if (m == 0) break;
-			long long left = until - now_ms();
-			if (left <= 0 || tls_poll(fd, POLLOUT, (int)left) != 0) break;
-			ssize_t w = send(fd, b, m, MSG_NOSIGNAL);
-			if (w <= 0) break;
-			br_ssl_engine_sendrec_ack(&sc->eng, (size_t)w);
+			if (tls_pump(eng, fd, POLLOUT, until) != 0) break;
 			continue;
 		}
-		b = br_ssl_engine_recvrec_buf(&sc->eng, &m);
-		if (m == 0) break;
-		{
-			long long left = until - now_ms();
-			if (left <= 0 || tls_poll(fd, POLLIN, (int)left) != 0) break;
-			ssize_t r = recv(fd, b, m, 0);
-			if (r <= 0) break;
-			br_ssl_engine_recvrec_ack(&sc->eng, (size_t)r);
-		}
+		if (tls_pump(eng, fd, POLLIN, until) != 0) break;
 	}
 	out[off] = 0;
 	return (ssize_t)off;
@@ -668,69 +664,80 @@ static int tx_build_parts(void) {
 static int transmit(int mfd, uint32_t wav_data_len) {
 	uint32_t wav_total = WAV_HDR_LEN + wav_data_len;
 	unsigned long long body_len = (unsigned long long)part1_len+wav_total+(sizeof part_tail-1);
-	char req[2048], *rp;
-	rp = app_str(req, "POST ");
-	rp = app_str(rp, g_epath);
-	rp = app_str(rp, " HTTP/1.1\r\nHost: ");
-	rp = app_str(rp, g_host);
-	rp = app_str(rp, "\r\nAuthorization: Bearer ");
-	rp = app_str(rp, g_apikey);
-	rp = app_str(rp, "\r\nContent-Type: multipart/form-data; boundary=" BOUNDARY "\r\nContent-Length: ");
-	rp = app_u64(rp, body_len);
-	rp = app_str(rp, "\r\nConnection: close\r\n\r\n");
-	if (rp - req >= (int)sizeof req) return -1;
+	/* bounded appends: req holds the API key, so it must never overflow
+	 * and is wiped the moment it has been handed to TLS */
+	#define APP(s) do { size_t L = sizeof(s)-1; if (rp + L > rend) goto fail; \
+		memcpy(rp, s, L); rp += L; } while (0)
+	#define APPV(s) do { size_t L = strlen(s); if (rp + L > rend) goto fail; \
+		memcpy(rp, s, L); rp += L; } while (0)
+	char req[2048], *rp = req, *rend = req + sizeof req;
+	int fd = -1;	/* every failure funnels to fail:, which closes and wipes */
+	APP("POST ");
+	APPV(g_epath);
+	APP(" HTTP/1.1\r\nHost: ");
+	APPV(g_host);
+	APP("\r\nAuthorization: Bearer ");
+	APPV(g_apikey);	/* NUL-terminated, startup-length-capped */
+	APP("\r\nContent-Type: multipart/form-data; boundary=" BOUNDARY "\r\nContent-Length: ");
+	{
+		char kb[24], *kp = kb + sizeof kb;
+		*--kp = 0;
+		if (!body_len) *--kp = '0';
+		while (body_len) { *--kp = (char)('0' + body_len % 10); body_len /= 10; }
+		APPV(kp);
+	}
+	APP("\r\nConnection: close\r\n\r\n");
+	#undef APP
+	#undef APPV
 	size_t rl = (size_t)(rp - req);
-	int fd = socket(g_dst.ss_family, SOCK_STREAM|SOCK_CLOEXEC, 0);
-	if (fd < 0) return -1;
+	fd = socket(g_dst.ss_family, SOCK_STREAM|SOCK_CLOEXEC, 0);
+	if (fd < 0) goto fail;
+	{	/* send each finished TLS record at once; Nagle would park the
+	 * tail segment until an RTT-elapsed ACK — free latency for us */
+		int one = 1;
+		(void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+	}
 	int fl = fcntl(fd, F_GETFL, 0);
 	fcntl(fd, F_SETFL, fl|O_NONBLOCK);
-	if (connect(fd, (struct sockaddr *)&g_dst, g_dstlen) != 0 && errno != EINPROGRESS) {
-		close(fd);
-		return -1;
-	}
-	if (tls_poll(fd, POLLOUT, 10000) != 0) { close(fd); return -1; }
+	if (connect(fd, (struct sockaddr *)&g_dst, g_dstlen) != 0 && errno != EINPROGRESS)
+		goto fail;
+	if (tls_poll(fd, POLLOUT, 10000) != 0) goto fail;
 	int err = 0;
 	socklen_t el = sizeof err;
-	if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0 || err) {
-		close(fd);
-		return -1;
-	}
+	if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0 || err)
+		goto fail;
 	fcntl(fd, F_SETFL, fl);
 	tls_profile_init(g_host);
-	if (br_ssl_engine_current_state(&g_sess.sc.eng) & BR_SSL_CLOSED) {
-		close(fd);
-		return -1;
-	}
+	if (br_ssl_engine_current_state(&g_sess.sc.eng) & BR_SSL_CLOSED)
+		goto fail;
 	long long until = now_ms() + 45000;
-	if (tls_handshake(&g_sess.sc, fd, now_ms()+12000) != 0) {
-		close(fd);
-		return -1;
+	if (tls_handshake(&g_sess.sc.eng, fd, now_ms()+12000) != 0) {
+		g_tls_sess_valid = 0;	/* poison guard: never reuse a dead session */
+		goto fail;
 	}
-	if (tls_send_all(&g_sess.sc, fd, (unsigned char *)req, rl, until) != 0 ||
-	    tls_send_all(&g_sess.sc, fd, (unsigned char *)part1_head, part1_len, until) != 0) {
-		close(fd);
-		return -1;
-	}
-	if (lseek(mfd, 0, SEEK_SET) < 0) { close(fd); return -1; }
+	br_ssl_engine_get_session_parameters(&g_sess.sc.eng, &g_tls_sess);
+	g_tls_sess_valid = 1;
+	if (tls_send_all(&g_sess.sc.eng, fd, (unsigned char *)req, rl, until) != 0 ||
+	    tls_send_all(&g_sess.sc.eng, fd, (unsigned char *)part1_head, part1_len, until) != 0)
+		goto fail;
+	if (lseek(mfd, 0, SEEK_SET) < 0) goto fail;
 	unsigned char chunk[4096];
 	uint32_t left = wav_total;
 	while (left) {
 		size_t want = left > sizeof chunk ? sizeof chunk : left;
 		ssize_t r = read(mfd, chunk, want);
-		if (r <= 0) { close(fd); return -1; }
-		if (tls_send_all(&g_sess.sc, fd, chunk, (size_t)r, until) != 0) {
-			close(fd);
-			return -1;
-		}
+		if (r <= 0) goto fail;
+		if (tls_send_all(&g_sess.sc.eng, fd, chunk, (size_t)r, until) != 0)
+			goto fail;
 		left -= (uint32_t)r;
 	}
-	if (tls_send_all(&g_sess.sc, fd, (unsigned char *)part_tail, sizeof part_tail-1, until) != 0) {
-		close(fd);
-		return -1;
-	}
-	ssize_t rl2 = tls_read_all(&g_sess.sc, fd, g_sess.resp, sizeof g_sess.resp, until);
+	if (tls_send_all(&g_sess.sc.eng, fd, (unsigned char *)part_tail, sizeof part_tail-1, until) != 0)
+		goto fail;
+	explicit_bzero(req, sizeof req);	/* key handled: no residue */
+	ssize_t rl2 = tls_read_all(&g_sess.sc.eng, fd, g_sess.resp, sizeof g_sess.resp, until);
 	close(fd);
-	if (rl2 <= 0) return -1;
+	fd = -1;
+	if (rl2 <= 0) goto fail;
 	int code = 0;
 	{
 		const char *s = g_sess.resp;
@@ -738,26 +745,23 @@ static int transmit(int mfd, uint32_t wav_data_len) {
 		    s[9]>='0'&&s[9]<='9'&&s[10]>='0'&&s[10]<='9'&&s[11]>='0'&&s[11]<='9')
 			code = (s[9]-'0')*100+(s[10]-'0')*10+(s[11]-'0');
 	}
-	if (code != 200) {
-		if (code) { /* surface the real reason (401 bad key, 429 rate limit...) */
-			char m[32], *mp = app_str(m, "transcriber: http ");
-			mp = app_u64(mp, (unsigned long long)code);
-			mp = app_str(mp, "\n");
-			write_all(2, m, (size_t)(mp - m));
-		}
-		return -1;
-	}
+	if (code != 200)
+		return code;	/* main logs one short line; positive = server reply */
 	const char *body = strstr(g_sess.resp, "\r\n\r\n");
-	if (!body) return -1;
+	if (!body) goto fail;
 	body += 4;
 	size_t blen = (size_t)rl2 - (size_t)(body - g_sess.resp);
-	if (json_get_text(body, blen, g_sess.tout, sizeof g_sess.tout) < 0) return -1;
+	if (json_get_text(body, blen, g_sess.tout, sizeof g_sess.tout) < 0) goto fail;
 	size_t tl = strlen(g_sess.tout);
 	if (write_all(1, g_sess.tout, tl) < 0) return -1;
 	if (tl == 0 || g_sess.tout[tl-1] != '\n')
 		if (write_all(1, "\n", 1) < 0) return -1;
 	paste_at_cursor(g_sess.tout);
 	return 0;
+fail:
+	if (fd >= 0) close(fd);
+	explicit_bzero(req, sizeof req);	/* carry no key residue out of a failed send */
+	return -1;
 }
 static int on_path(const char *name) {
 	const char *pv = getenv("PATH");
@@ -780,9 +784,13 @@ static int on_path(const char *name) {
 }
 static void paste_at_cursor(const char *text) {
 	/* xclip/xdotool are X11-only; skip paste under Wayland or when the
-	 * helpers are not on PATH, instead of silently typing nothing */
-	if (!on_path("xclip") || !on_path("xdotool") ||
-	    (getenv("WAYLAND_DISPLAY") && !getenv("DISPLAY"))) {
+	 * helpers are not on PATH, instead of silently typing nothing.
+	 * XWayland sessions export DISPLAY too, so WAYLAND_DISPLAY alone is
+	 * not proof of Wayland: XDG_SESSION_TYPE is the primary signal. */
+	const char *st = getenv("XDG_SESSION_TYPE");
+	int wl = (st && !strcmp(st, "wayland")) ||
+	         (getenv("WAYLAND_DISPLAY") && !getenv("DISPLAY"));
+	if (!on_path("xclip") || !on_path("xdotool") || wl) {
 		eput("transcriber: paste skipped (X11-only helpers)\n");
 		return;
 	}
@@ -813,8 +821,47 @@ static void paste_at_cursor(const char *text) {
 			int s;
 			while (waitpid(x, &s, 0) < 0 && errno == EINTR) ;
 		}
-		struct timespec ts = { 0, 50000000 };
-		nanosleep(&ts, 0);
+		/* paste only once the clipboard really holds the transcript:
+		 * the old fixed 50 ms sleep raced xclip's ownership transfer
+		 * and could paste stale clipboard content into the wrong window.
+		 * xclip -o round-trip = the selection is actually served.
+		 * probe immediately, then 10 ms steps up to a 2 s cap: the
+		 * common case costs one xclip exec, not a fixed sleep */
+		{
+			char probe[256];
+			size_t want = strlen(text);
+			if (want > sizeof probe - 1) want = sizeof probe - 1;
+			int ok = 0;
+			long long deadline = now_ms() + 2000;
+			for (;;) {
+				int qfds[2];
+				if (pipe(qfds) != 0) break;
+				pid_t q = fork();
+				if (q == 0) {
+					dup2(qfds[1], 1);
+					close(qfds[0]);
+					close(qfds[1]);
+					execlp("xclip", "xclip", "-selection", "clipboard", "-o", (char *)0);
+					_exit(0);
+				}
+				close(qfds[1]);
+				ssize_t r, tot = 0;
+				while (tot < (ssize_t)want &&
+				       (r = read(qfds[0], probe + tot, (size_t)(want - tot))) > 0)
+					tot += r;
+				int ws;
+				while (waitpid(q, &ws, 0) < 0 && errno == EINTR) ;
+				close(qfds[0]);
+				if (tot == (ssize_t)want && memcmp(probe, text, want) == 0) {
+					ok = 1;
+					break;
+				}
+				if (now_ms() >= deadline) break;
+				struct timespec ts = { 0, 10000000 };
+				nanosleep(&ts, 0);
+			}
+			if (!ok) _exit(0);	/* never confirmed: paste nothing */
+		}
 		pid_t d = fork();
 		if (d == 0) {
 			execlp("xdotool", "xdotool", "key", "ctrl+shift+v", (char *)0);
@@ -834,7 +881,6 @@ static int do_press(int *evfds, int nev, int pcm, long long t0, uint32_t *out_le
 	wav_header(wh, 0);
 	if (write_all(mfd, wh, sizeof wh) < 0) { close(mfd); return -1; }
 	uint32_t total = 0;
-	int half = 0;
 	(void)ioctl(pcm, SNDRV_PCM_IOCTL_DROP, 0);
 	(void)ioctl(pcm, SNDRV_PCM_IOCTL_PREPARE, 0);
 	(void)ioctl(pcm, SNDRV_PCM_IOCTL_START, 0);
@@ -864,7 +910,7 @@ static int do_press(int *evfds, int nev, int pcm, long long t0, uint32_t *out_le
 		for (;;) {
 			ssize_t n;
 			int more = 0;
-			n = conv_read(pcm, g_sess.ring[half], HALF_SAMPLES, &more);
+			n = conv_read(pcm, g_sess.pcmbuf, PCM_SAMPLES, &more);
 			if (n < 0) {
 				if (errno == EAGAIN || errno == EWOULDBLOCK) break;
 				if (errno == EPIPE) {
@@ -877,13 +923,12 @@ static int do_press(int *evfds, int nev, int pcm, long long t0, uint32_t *out_le
 			}
 			if (n == 0) break;
 			if (total + (uint32_t)n > MAX_WAV_DATA) break;
-			if (write_all(mfd, g_sess.ring[half], (size_t)n) < 0) {
+			if (write_all(mfd, g_sess.pcmbuf, (size_t)n) < 0) {
 				close(mfd);
 				return -1;
 			}
 			total += (uint32_t)n;
-			half ^= 1;
-			if (!more && (uint32_t)n < sizeof g_sess.ring[half]) break;
+			if (!more && (uint32_t)n < sizeof g_sess.pcmbuf) break;
 		}
 		if (now_ms() - t0 > PRESS_MAX_MS) {
 			close(mfd);
@@ -904,15 +949,13 @@ static void session_drop(void) {
 		explicit_bzero(&g_sess, sizeof g_sess);
 }
 static void usage(void) {
-	eput("usage: transcriber [--event-path /dev/input/eventX]... [--keycode N] [--alsa-dev PCM] [--help]\n");
+	eput("usage: transcriber [--event-path /dev/input/eventX]... [--alsa-dev PCM] [--help]\n");
 }
 int main(int argc, char **argv) {
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--event-path") && i+1 < argc) {
 			if (g_nevpaths >= MAX_EVENTS) die("too many --event-path");
 			g_evpaths[g_nevpaths++] = argv[++i];
-		} else if (!strcmp(argv[i], "--keycode") && i+1 < argc) {
-			g_keycode = atoi(argv[++i]);
 		} else if (!strcmp(argv[i], "--alsa-dev") && i+1 < argc) {
 			g_alsadev = argv[++i];
 		} else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
@@ -934,7 +977,7 @@ int main(int argc, char **argv) {
 	int evfds[MAX_EVENTS], nev = 0;
 	if (g_nevpaths) {
 		for (int i = 0; i < g_nevpaths; i++) {
-			int fd = ev_open_grab(g_evpaths[i]);
+			int fd = ev_open(g_evpaths[i]);
 			if (fd >= 0) evfds[nev++] = fd;
 		}
 		if (!nev) die("no event device opened");
@@ -981,7 +1024,22 @@ int main(int argc, char **argv) {
 				uint32_t wlen = 0;
 				int mfd = do_press(evfds, nev, pcm, t, &wlen);
 				if (mfd < 0) { session_drop(); continue; }
-				if (transmit(mfd, wlen) != 0) eput("transcriber: discarded, idle\n");
+				{	/* one short line per failure, nothing on success */
+					int r = transmit(mfd, wlen);
+					if (r > 0) {	/* server said no: r = HTTP status */
+						eput("transcriber: HTTP ");
+						{
+							char b[3];
+							b[0] = (char)('0' + r / 100);
+							b[1] = (char)('0' + (r / 10) % 10);
+							b[2] = (char)('0' + r % 10);
+							write_all(2, b, 3);
+						}
+						eput("\n");
+					} else if (r != 0) {
+						eput("transcriber: send failed\n");
+					}
+				}
 				close(mfd);
 				session_drop();
 			}
@@ -991,7 +1049,7 @@ int main(int argc, char **argv) {
 			while (nev == 0) {
 				if (g_nevpaths) {
 					for (int k = 0; k < g_nevpaths; k++) {
-						int fd = ev_open_grab(g_evpaths[k]);
+						int fd = ev_open(g_evpaths[k]);
 						if (fd >= 0) evfds[nev++] = fd;
 					}
 				} else {

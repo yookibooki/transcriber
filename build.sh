@@ -9,7 +9,7 @@ need() { command -v "$1" >/dev/null 2>&1 || { echo "build.sh: need $1" >&2; exit
 need "$CC"; need openssl; need strip; need python3
 # used later: curl/tar (only when downloading), sha256sum -c (digest verify),
 # stat -c%s and file -b (final report line) — GNU coreutils assumptions
-need sha256sum; need stat; need file; need cut
+need sha256sum; need stat; need file; need cut; need tr
 if [ ! -d build/bearssl ]; then
   need curl; need tar
 fi
