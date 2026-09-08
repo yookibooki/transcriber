@@ -6,11 +6,10 @@ Single-file, statically-linked C push-to-talk daemon: hold Right Ctrl, speak, re
 
 | Path | What |
 |---|---|
-| `transcriber.c` | Whole tool (1071 LOC, no heap, no libc TLS stack) |
-| `build.sh` | Build: embeds CA anchors, compiles BearSSL, links static, installs to `~/.local/bin/transcriber` |
-| `anchors/*.pem` | Pinned trust anchors for `api.groq.com`: ISRG Root X1/X2 (Let's Encrypt), GTS Root R4 (Google) — flattened to DER in `build/anchors.h` at build time |
+| `transcriber.c` | Whole tool (985 LOC, no heap, no libc TLS stack) |
+| `build.sh` | Build: compiles BearSSL + its `brssl` tool (generates the anchor table), links static, installs to `~/.local/bin/transcriber` |
+| `anchors/*.pem` | Pinned trust anchors for `api.groq.com`: ISRG Root X1/X2 (Let's Encrypt), GTS Root R4 (Google) — compiled into a const `br_x509_trust_anchor` table (`build/ta.h`) at build time by the vendored `brssl`; the daemon does no anchor ASN.1 decode |
 | `build/` | Build cache/artifacts — gitignored |
-| `tools/` | Local-only measurement rigs (`rec-cpu.py`, `res-qa/`) — gitignored, never pushed |
 
 ## Build
 
@@ -18,8 +17,8 @@ Single-file, statically-linked C push-to-talk daemon: hold Right Ctrl, speak, re
 ./build.sh
 ```
 
-Needs: `musl-gcc`, `openssl`, `strip`, `python3`, `curl`, `tar`, `sha256sum`, `stat`, `file`, `tr`, `cut`.
-Downloads BearSSL 0.6 (sha256-pinned), caches objects in `build/obj/`. Output: `~/.local/bin/transcriber`, 112,280 bytes static stripped ELF. Do **not** commit `build/`.
+Needs: `musl-gcc`, `strip`, `curl`, `tar`, `sha256sum`, `stat`, `file`, `tr`, `cut` (no openssl, no python).
+Downloads BearSSL 0.6 (sha256-pinned), caches objects in `build/obj/` (first run: ~53 s; cached: ~2 s). Output: `~/.local/bin/transcriber`, 108,176 bytes static stripped ELF. Do **not** commit `build/`.
 
 ## Run
 
@@ -38,7 +37,7 @@ Env config (env-only; no provider flags). Defaults in parens:
 
 Any OpenAI-compatible `/audio/transcriptions` endpoint works without recompile. TLS still trusts **only `anchors/`** — a provider whose chain terminates elsewhere handshake-fails by design; adding a root to `anchors/` is a trust-policy change (ask-first).
 
-Flags: `--event-path /dev/input/eventX` (repeatable), `--alsa-dev /dev/snd/pcmC0D0c` (defaults first, then any `pcmC*D*c` under `/dev/snd`), `--help`. Right Ctrl is the only hotkey — there is no keycode option.
+No flags. Autoscan only: Right Ctrl from any `eventN` device that has that keycode (kernel `EVIOCGBIT` query), mic from `/dev/snd/pcmC0D0c`, else any `pcmC*D*c` under `/dev/snd`. Right Ctrl is the only hotkey — there is no keycode option either.
 
 Runtime deps: paste needs `xclip` + `xdotool` on PATH (X11; skipped when the session is Wayland, incl. `XDG_SESSION_TYPE=wayland`); `/dev/input/` + `/dev/snd/` access (input + audio groups or root); DNS from `/etc/resolv.conf`.
 
@@ -49,8 +48,8 @@ Runtime deps: paste needs `xclip` + `xdotool` on PATH (X11; skipped when the ses
 - No `EVIOCGRAB` — keyboard stays fully usable.
 - Clipboard paste: only after `xclip -o` confirms the transcript is actually served (up to 2 s, then skip) — replaces a fixed 50 ms race. Clipboard content is still overwritten by design.
 - After each send, the request buffer (which contains the API key) is zeroed, and session memory (`g_sess`: TLS state, keys, transcript buffers) is wiped via `madvise(MADV_DONTNEED)`; `sizeof g_sess` is compile-time asserted to be a page multiple so the wipe stays exact.
-- Own DNS (raw UDP to all IPv4 nameservers in resolv.conf, in order) and own TLS 1.2 client (ECDHE AES-GCM suites only, pinned anchors — never a system store). TLS session-ID resumption keeps the handshake state between sends (user-approved): repeat dictations do an abbreviated handshake; if the server refuses, it falls back to a full handshake automatically.
-- The daemon never exits at runtime: poll errors retry after 1s, dead input devices are dropped/re-scanned, record failures discard the capture silently. A rejected send logs one line: `transcriber: HTTP 429` (server status) or `transcriber: send failed` (transport). Exit codes 1 (bad env/anchors/DNS) and 2 (no mic) are startup-only fail-fast.
+- Own DNS (raw UDP to all IPv4 nameservers in resolv.conf, in order) and own TLS 1.2 client (ECDHE AES-GCM suites only, pinned anchors as a compiled-in table — never a system store). TLS session-ID resumption keeps the handshake state between sends (user-approved): repeat dictations do an abbreviated handshake; if the server refuses, it falls back to a full handshake automatically.
+- The daemon never exits at runtime: poll errors retry after 1s, dead input devices are dropped/re-scanned, record failures discard the capture silently. A rejected send logs one line: `transcriber: HTTP 429` (server status) or `transcriber: send failed` (transport). Exit codes 1 (bad env/DNS, stray arguments) and 2 (no mic) are startup-only fail-fast; the anchor table is a build-time artifact, so it cannot fail at runtime.
 - Transcript goes to stdout and cursor-paste both.
 
 ## Autostart (systemd user service)
@@ -61,19 +60,3 @@ Runtime deps: paste needs `xclip` + `xdotool` on PATH (X11; skipped when the ses
 systemctl --user status|restart|stop transcriber.service
 journalctl --user -u transcriber.service -f      # logs: "dns ok", "mic ...", "ready"
 ```
-
-## Definition of done
-
-| Metric | PASS |
-|---|---|
-| Idle CPU | <5 wakeups/s |
-| Idle Memory | <200KB |
-| Rec CPU | <2% 1-core |
-| Binary | <200KB stripped |
-| LOC | <1100, soft limit |
-
-Measured on the 2026-09-08 build: 0 context switches over 10 s idle, RSS 144 kB, binary 112,288 bytes stripped static, 1,005 LOC. Rebuilt after the 2026-09-08 review fixes (single-page wipe assertion, right-ctrl-only, tls pump de-dup, paste confirmation): 112,280 bytes, 1,071 LOC. Idle/rec-CPU/memory not re-measured — rigs are local-only.
-
-## History
-
-Renamed 2026-09-08 from `whisper-push` (old repo `~/workspace/whisperpush-zero` no longer exists; stale references remain in `~/workspace/context.md`). `proof/` (foreign challenge-variant artifacts claiming seccomp/`--no-sandbox`/`--self-test` features that never existed here) was added in the `init` commit by mistake and removed from the tree the same day; `tools/` was removed from the tree and git history by rewrite the same day. Nothing in either was sensitive.

@@ -8,7 +8,6 @@
 #include <time.h>
 #include <signal.h>
 #include <poll.h>
-#include <netdb.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
@@ -23,7 +22,7 @@
 #include <linux/input.h>
 #include <sound/asound.h>
 #include <bearssl.h>
-#include "anchors.h"	/* generated at build time from anchors/ */
+#include "ta.h"		/* generated at build time by `brssl ta` from anchors/ */
 #define MAX_EVENTS 8
 #define SAMPLE_RATE 16000
 #define CHANNELS 1
@@ -40,9 +39,7 @@
 #define LANG_MAX 16
 #define EPATH_MAX 192	/* endpoint path; not the libc PATH_MAX */
 #define APIKEY_MAX 512
-static const char *g_evpaths[MAX_EVENTS];
-static int g_nevpaths;
-static const char *g_alsadev = "/dev/snd/pcmC0D0c";
+static const char g_alsadev[] = "/dev/snd/pcmC0D0c";	/* preferred; mic_scan() tries the rest */
 /* Right Ctrl is the only hotkey; no option exists to change it */
 static const int g_keycode = KEY_RIGHTCTRL;
 static struct __attribute__((aligned(4096))) session {
@@ -55,7 +52,7 @@ static struct __attribute__((aligned(4096))) session {
 } g_sess;
 /* MADV_DONTNEED rounds the length up to whole pages: g_sess must occupy an
  * exact page multiple or the wipe after each send would also zero the
- * globals that follow it in .bss (g_nevpaths etc.) */
+ * globals that follow it in .bss (g_apikey etc.) */
 _Static_assert(sizeof g_sess % 4096 == 0, "g_sess must be a page multiple");
 static char g_apikey[APIKEY_MAX];
 static size_t g_apikey_len;
@@ -75,10 +72,6 @@ static char g_host[HOST_MAX] = "api.groq.com";
  * only anchors/ — a host whose chain doesn't terminate there fails closed. */
 static char g_model[MODEL_MAX] = "whisper-large-v3-turbo";
 static char g_lang[LANG_MAX] = "en";static char g_epath[EPATH_MAX] = "/openai/v1/audio/transcriptions";
-static br_x509_trust_anchor g_tas[4];
-static unsigned g_ntas;
-static unsigned char g_ta_dn[4][256];
-static unsigned char g_ta_key[4][600];
 static struct sockaddr_storage g_dst;
 static socklen_t g_dstlen;
 static ssize_t write_all(int fd, const void *b, size_t n);
@@ -118,50 +111,6 @@ static ssize_t write_all(int fd, const void *b, size_t n) {
 		off += (size_t)w;
 	}
 	return (ssize_t)off;
-}
-struct dn_acc { unsigned char *dst; size_t cap, len; };
-static void dn_append(void *ctx, const void *buf, size_t len) {
-	struct dn_acc *a = ctx;
-	if (a->len + len > a->cap) len = a->cap - a->len;
-	memcpy(a->dst + a->len, buf, len);
-	a->len += len;
-}
-static unsigned anchors_load(void) {
-	static br_x509_decoder_context dc;
-	unsigned n = 0;
-	for (unsigned i = 0; i < N_ANCHORS && n < 4; i++) {
-		struct dn_acc acc = { g_ta_dn[n], sizeof g_ta_dn[n], 0 };
-		br_x509_decoder_init(&dc, dn_append, &acc);
-		br_x509_decoder_push(&dc, g_anchor_der[i], g_anchor_len[i]);
-		br_x509_pkey *pk = br_x509_decoder_get_pkey(&dc);
-		if (!pk || acc.len == 0 || acc.len > sizeof g_ta_dn[n]) continue;
-		br_x509_trust_anchor *ta = &g_tas[n];
-		ta->dn.data = g_ta_dn[n];
-		ta->dn.len = acc.len;
-		ta->flags = BR_X509_TA_CA;
-		ta->pkey.key_type = pk->key_type;
-		if (pk->key_type == BR_KEYTYPE_RSA) {
-			size_t nl = pk->key.rsa.nlen, el = pk->key.rsa.elen;
-			if (nl + el > sizeof g_ta_key[n]) continue;
-			memcpy(g_ta_key[n], pk->key.rsa.n, nl);
-			memcpy(g_ta_key[n] + nl, pk->key.rsa.e, el);
-			ta->pkey.key.rsa.n = g_ta_key[n];
-			ta->pkey.key.rsa.nlen = nl;
-			ta->pkey.key.rsa.e = g_ta_key[n] + nl;
-			ta->pkey.key.rsa.elen = el;
-		} else if (pk->key_type == BR_KEYTYPE_EC) {
-			size_t ql = pk->key.ec.qlen;
-			if (ql > sizeof g_ta_key[n]) continue;
-			memcpy(g_ta_key[n], pk->key.ec.q, ql);
-			ta->pkey.key.ec.curve = pk->key.ec.curve;
-			ta->pkey.key.ec.q = g_ta_key[n];
-			ta->pkey.key.ec.qlen = ql;
-		} else {
-			continue;
-		}
-		n++;
-	}
-	return n;
 }
 static void cfg_str(const char *name, char *dst, size_t cap) {
 	const char *e = getenv(name);
@@ -325,12 +274,6 @@ static int mic_open(void) {
 	exit(2);
 	return -1;
 }
-static int ev_open(const char *path) {
-	int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-	if (fd < 0) return -1;
-	/* no EVIOCGRAB: exclusive grab swallows all typing on USB/laptop kbd */
-	return fd;
-}
 static int ev_autoscan(int *fds) {
 	int n = 0;
 	for (int i = 0; i < 32 && n < MAX_EVENTS; i++) {
@@ -367,7 +310,7 @@ static void wav_header(unsigned char *h, uint32_t data_len) {
 }
 static const uint16_t tls_suites[] = { BR_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, BR_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, BR_TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, BR_TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 };
 static void tls_profile_init(const char *host) {
-	br_x509_minimal_init(&g_sess.xc, &br_sha256_vtable, g_tas, g_ntas);
+	br_x509_minimal_init(&g_sess.xc, &br_sha256_vtable, TAs, TAs_NUM);
 	br_x509_minimal_set_hash(&g_sess.xc, br_sha256_ID, &br_sha256_vtable);
 	br_x509_minimal_set_hash(&g_sess.xc, br_sha384_ID, &br_sha384_vtable);
 	br_x509_minimal_set_rsa(&g_sess.xc, br_rsa_i31_pkcs1_vrfy);
@@ -949,42 +892,23 @@ static void session_drop(void) {
 		explicit_bzero(&g_sess, sizeof g_sess);
 }
 static void usage(void) {
-	eput("usage: transcriber [--event-path /dev/input/eventX]... [--alsa-dev PCM] [--help]\n");
+	eput("usage: transcriber (no flags; TRANSCRIBE_* env only)\n");
 }
 int main(int argc, char **argv) {
-	for (int i = 1; i < argc; i++) {
-		if (!strcmp(argv[i], "--event-path") && i+1 < argc) {
-			if (g_nevpaths >= MAX_EVENTS) die("too many --event-path");
-			g_evpaths[g_nevpaths++] = argv[++i];
-		} else if (!strcmp(argv[i], "--alsa-dev") && i+1 < argc) {
-			g_alsadev = argv[++i];
-		} else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
-			usage();
-			return 0;
-		} else {
-			usage();
-			return 1;
-		}
+	(void)argv;
+	if (argc > 1) {	/* no flags exist; fail fast on stray arguments */
+		usage();
+		return 1;
 	}
 	signal(SIGPIPE, SIG_IGN);
 	key_init();
-	g_ntas = anchors_load();
-	if (g_ntas == 0) die("no trust anchors");
 	if (dns_resolve(g_host, &g_dst, &g_dstlen) != 0) { eput("transcriber: DNS resolve failed (phase 0): "); eput(g_host); eput("\n"); return 1; }
 	eput("transcriber: dns ok\n");
 	if (tx_build_parts() != 0) die("provider config too long");
 	int pcm = mic_open();
-	int evfds[MAX_EVENTS], nev = 0;
-	if (g_nevpaths) {
-		for (int i = 0; i < g_nevpaths; i++) {
-			int fd = ev_open(g_evpaths[i]);
-			if (fd >= 0) evfds[nev++] = fd;
-		}
-		if (!nev) die("no event device opened");
-	} else {
-		nev = ev_autoscan(evfds);
-		if (!nev) die("no key-capable event device found (try --event-path)");
-	}
+	int evfds[MAX_EVENTS];
+	int nev = ev_autoscan(evfds);
+	if (!nev) die("no key-capable event device found");
 	eput("transcriber: ready\n");
 	struct pollfd pf[MAX_EVENTS];
 	for (int i = 0; i < nev; i++) {
@@ -1045,20 +969,10 @@ int main(int argc, char **argv) {
 			}
 		}
 		if (nev == 0) {
-			/* all inputs gone: reopen explicit paths or rescan, forever */
-			while (nev == 0) {
-				if (g_nevpaths) {
-					for (int k = 0; k < g_nevpaths; k++) {
-						int fd = ev_open(g_evpaths[k]);
-						if (fd >= 0) evfds[nev++] = fd;
-					}
-				} else {
-					nev = ev_autoscan(evfds);
-				}
-				if (nev == 0) {
-					struct timespec ts = { 1, 0 };
-					nanosleep(&ts, 0);
-				}
+			/* all inputs gone: rescan until one reappears, never exit */
+			while ((nev = ev_autoscan(evfds)) == 0) {
+				struct timespec ts = { 1, 0 };
+				nanosleep(&ts, 0);
 			}
 			eput("transcriber: input recovered\n");
 			for (int i = 0; i < nev; i++) {
