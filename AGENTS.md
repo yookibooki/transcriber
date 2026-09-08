@@ -27,7 +27,7 @@ Env-only, read at startup: TRANSCRIBE_API_KEY (required); TRANSCRIBE_HOST/MODEL/
 Agents run no tests (tools/ = measurement rigs). Build, hand over, report changes; never claim PASS.
 
 ## Code rules
-- transcriber.c only: C11, tabs, no heap, all error paths handled; tools/ = dep-free python rigs.
+- transcriber.c only: C11, tabs, no heap, all error paths handled; tools/ = dep-free python rigs, local-only (untracked, never pushed).
 - Never exit at runtime: poll errors retry 1s; lost inputs rescan; failures log `discarded, idle`. Exit 1 (env/DNS), 2 (no mic): startup-only.
 - No hardcoded device numbers, distro paths/packages, fallback DNS.
 - TRANSCRIBE_API_KEY read once, zeroed, unset; g_sess madvise(DONTNEED)-wiped after send. Never weaken security/pinning to pass a build.
