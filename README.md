@@ -10,6 +10,7 @@ Single-file, statically-linked C push-to-talk daemon: hold a key (default Right 
 | `build.sh` | Build: embeds CA anchors, compiles BearSSL, links static, installs to `~/.local/bin/transcriber` |
 | `anchors/*.pem` | Pinned trust anchors for `api.groq.com`: ISRG Root X1/X2 (Let's Encrypt), GTS Root R4 (Google) — flattened to DER in `build/anchors.h` at build time |
 | `build/` | Build cache/artifacts — gitignored |
+| `tools/` | Local-only measurement rigs (`rec-cpu.py`) — gitignored, never pushed |
 
 ## Build
 
@@ -74,4 +75,4 @@ Measured on the 2026-09-08 build: 0 context switches over 10 s idle, RSS 144 kB,
 
 ## History
 
-Renamed 2026-09-08 from `whisper-push` (old repo `~/workspace/whisperpush-zero` no longer exists; stale references remain in `~/workspace/context.md`). Foreign/proof artifacts never in git history removed 2026-09-08: `proof/` claimed seccomp/`--no-sandbox`/`--self-test` features that never existed in any commit of this repo — they came from someone else's challenge variant of the code.
+Renamed 2026-09-08 from `whisper-push` (old repo `~/workspace/whisperpush-zero` no longer exists; stale references remain in `~/workspace/context.md`). `proof/` (foreign challenge-variant artifacts claiming seccomp/`--no-sandbox`/`--self-test` features that never existed here) was added in the `init` commit by mistake and removed from the tree the same day; `tools/` was removed from the tree and git history by rewrite the same day. Nothing in either was sensitive.

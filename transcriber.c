@@ -738,7 +738,15 @@ static int transmit(int mfd, uint32_t wav_data_len) {
 		    s[9]>='0'&&s[9]<='9'&&s[10]>='0'&&s[10]<='9'&&s[11]>='0'&&s[11]<='9')
 			code = (s[9]-'0')*100+(s[10]-'0')*10+(s[11]-'0');
 	}
-	if (code != 200) return -1;
+	if (code != 200) {
+		if (code) { /* surface the real reason (401 bad key, 429 rate limit...) */
+			char m[32], *mp = app_str(m, "transcriber: http ");
+			mp = app_u64(mp, (unsigned long long)code);
+			mp = app_str(mp, "\n");
+			write_all(2, m, (size_t)(mp - m));
+		}
+		return -1;
+	}
 	const char *body = strstr(g_sess.resp, "\r\n\r\n");
 	if (!body) return -1;
 	body += 4;
