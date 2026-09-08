@@ -14,6 +14,7 @@
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <sys/random.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <linux/input.h>
@@ -26,8 +27,8 @@
 #define HALF_SAMPLES 2048
 #define RING_HALVES 2
 #define PRESS_MIN_MS 300
-#define PRESS_MAX_MS 30000
-#define MAX_WAV_DATA (30u*16000u*2u)
+#define PRESS_MAX_MS 60000
+#define MAX_WAV_DATA (60u*16000u*2u)
 #define WAV_HDR_LEN 44
 #define RESP_MAX 8192
 #define TEXT_MAX 4096
@@ -55,6 +56,7 @@ static unsigned char g_ta_key[4][600];
 static struct sockaddr_storage g_dst;
 static socklen_t g_dstlen;
 static ssize_t write_all(int fd, const void *b, size_t n);
+static void paste_at_cursor(const char *text);
 static void eput(const char *s) { write_all(2, s, strlen(s)); }
 static void die(const char *m) {
 	eput("whisper-push: ");
@@ -248,8 +250,7 @@ static int mic_open(void) {
 static int ev_open_grab(const char *path) {
 	int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
 	if (fd < 0) return -1;
-	int g = 1;
-	(void)ioctl(fd, EVIOCGRAB, &g);
+	/* no EVIOCGRAB: exclusive grab swallows all typing on USB/laptop kbd */
 	return fd;
 }
 static int ev_autoscan(int *fds) {
@@ -270,8 +271,7 @@ static int ev_autoscan(int *fds) {
 			close(fd);
 			continue;
 		}
-		int g = 1;
-		(void)ioctl(fd, EVIOCGRAB, &g);
+		/* no EVIOCGRAB: keep keyboard usable by X/apps */
 		fds[n++] = fd;
 	}
 	return n;
@@ -649,7 +649,50 @@ static int transmit(int mfd, uint32_t wav_data_len) {
 	if (write_all(1, g_sess.tout, tl) < 0) return -1;
 	if (tl == 0 || g_sess.tout[tl-1] != '\n')
 		if (write_all(1, "\n", 1) < 0) return -1;
+	paste_at_cursor(g_sess.tout);
 	return 0;
+}
+static void paste_at_cursor(const char *text) {
+	pid_t p = fork();
+	if (p != 0) {
+		if (p > 0) {
+			int s;
+			while (waitpid(p, &s, 0) < 0 && errno == EINTR) ;
+		}
+		return;
+	}
+	if (fork() != 0) _exit(0);
+	{
+		int fds[2];
+		if (pipe(fds) != 0) _exit(0);
+		pid_t x = fork();
+		if (x == 0) {
+			dup2(fds[0], 0);
+			close(fds[0]);
+			close(fds[1]);
+			execlp("xclip", "xclip", "-selection", "clipboard", "-i", (char *)0);
+			_exit(0);
+		}
+		close(fds[0]);
+		write_all(fds[1], text, strlen(text));
+		close(fds[1]);
+		if (x > 0) {
+			int s;
+			while (waitpid(x, &s, 0) < 0 && errno == EINTR) ;
+		}
+		struct timespec ts = { 0, 50000000 };
+		nanosleep(&ts, 0);
+		pid_t d = fork();
+		if (d == 0) {
+			execlp("xdotool", "xdotool", "key", "ctrl+shift+v", (char *)0);
+			_exit(0);
+		}
+		if (d > 0) {
+			int s;
+			while (waitpid(d, &s, 0) < 0 && errno == EINTR) ;
+		}
+		_exit(0);
+	}
 }
 static int do_press(int *evfds, int nev, int pcm, long long t0, uint32_t *out_len) {
 	int mfd = memfd_create("wpw", MFD_CLOEXEC);
