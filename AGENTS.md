@@ -1,6 +1,3 @@
-# AGENTS
-
-## Project
 Single-file push-to-talk daemon (`transcriber.c`): hold Right Ctrl, speak → transcript at the cursor.
 
 Goal: simplest solution that just works.
@@ -15,10 +12,7 @@ Philosophy: extreme efficiency, idiomatic C — minimal RAM / binary / LOC / sys
 | LOC | <1500 |
 | Compatibility | all distros, any arch |
 
-## Build
-```sh
-./build.sh
-```
+Build: `./build.sh`
 
 ## Tests
 Agents run no tests. Build and ask user to test.

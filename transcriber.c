@@ -12,17 +12,16 @@
 #include <sys/socket.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
-#include <dirent.h>	/* DT_* constants only; enum via getdents64(2), not opendir(3) */
+#include <dirent.h>	
 #include <sys/syscall.h>
-#include <sys/random.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <arpa/inet.h>
+#include <netdb.h>
 #include <linux/input.h>
 #include <sound/asound.h>
 #include <bearssl.h>
-#include "ta.h"		/* generated at build time by `brssl ta` from anchors/ */
+#include "ta.h"		
 #define MAX_EVENTS 8
 #define SAMPLE_RATE 16000
 #define CHANNELS 1
@@ -37,10 +36,9 @@
 #define HOST_MAX 128
 #define MODEL_MAX 64
 #define LANG_MAX 16
-#define EPATH_MAX 192	/* endpoint path; not the libc PATH_MAX */
+#define EPATH_MAX 192	
 #define APIKEY_MAX 512
-static const char g_alsadev[] = "/dev/snd/pcmC0D0c";	/* preferred; mic_scan() tries the rest */
-/* Right Ctrl is the only hotkey; no option exists to change it */
+
 static const int g_keycode = KEY_RIGHTCTRL;
 static struct __attribute__((aligned(4096))) session {
 	br_ssl_client_context sc;
@@ -50,32 +48,21 @@ static struct __attribute__((aligned(4096))) session {
 	char tout[TEXT_MAX];
 	int16_t pcmbuf[PCM_SAMPLES];
 } g_sess;
-/* MADV_DONTNEED rounds the length up to whole pages: g_sess must occupy an
- * exact page multiple or the wipe after each send would also zero the
- * globals that follow it in .bss (g_apikey etc.) */
+
 _Static_assert(sizeof g_sess % 4096 == 0, "g_sess must be a page multiple");
 static char g_apikey[APIKEY_MAX];
-static size_t g_apikey_len;
-/* TLS session-ID resumption (user-approved 2026-09-09): the master secret
- * (48 bytes) deliberately survives between sends so each dictation can do
- * an abbreviated handshake instead of a full ECDHE exchange (~1 RTT + key
- * agreement saved). It lives OUTSIDE g_sess so the page-wide wipe after
- * each send still covers the engine, transcript and buffers. Server may
- * refuse resumption: BearSSL then falls back to a full handshake silently.
- * Note TLS 1.2 resumption does not re-transmit the certificate: identity
- * is bound to the pinned-anchor-authenticated session that minted it. */
+
 static br_ssl_session_parameters g_tls_sess;
 static unsigned g_tls_sess_valid;
 static char g_host[HOST_MAX] = "api.groq.com";
-/* provider config (env-only, OpenAI-compatible /audio/transcriptions API):
- * TRANSCRIBE_HOST / _MODEL / _LANGUAGE / _PATH / _API_KEY. TLS still trusts
- * only anchors/ — a host whose chain doesn't terminate there fails closed. */
+
 static char g_model[MODEL_MAX] = "whisper-large-v3-turbo";
 static char g_lang[LANG_MAX] = "en";static char g_epath[EPATH_MAX] = "/openai/v1/audio/transcriptions";
 static struct sockaddr_storage g_dst;
 static socklen_t g_dstlen;
 static ssize_t write_all(int fd, const void *b, size_t n);
 static void paste_at_cursor(const char *text);
+static int on_path(const char *name);
 static void eput(const char *s) { write_all(2, s, strlen(s)); }
 static void die(const char *m) {
 	eput("transcriber: ");
@@ -116,12 +103,12 @@ static void cfg_str(const char *name, char *dst, size_t cap) {
 	const char *e = getenv(name);
 	if (!e || !*e) return;
 	size_t n = strlen(e);
-	if (n >= cap) { /* fail fast at startup, not a mystery 404 later */
+	if (n >= cap) { 
 		eput("transcriber: "); eput(name); eput(" too long\n");
 		exit(1);
 	}
 	memcpy(dst, e, n + 1);
-	explicit_bzero((char *)e, n); /* same hygiene as the API key */
+	explicit_bzero((char *)e, n); 
 	unsetenv(name);
 }
 static void key_init(void) {
@@ -130,7 +117,6 @@ static void key_init(void) {
 	size_t n = strlen(e);
 	if (n >= APIKEY_MAX) die("TRANSCRIBE_API_KEY too long");
 	memcpy(g_apikey, e, n + 1);
-	g_apikey_len = n;
 	explicit_bzero((char *)e, n);
 	unsetenv("TRANSCRIBE_API_KEY");
 	cfg_str("TRANSCRIBE_HOST", g_host, sizeof g_host);
@@ -139,7 +125,7 @@ static void key_init(void) {
 	cfg_str("TRANSCRIBE_PATH", g_epath, sizeof g_epath);
 }
 static int pcm_tick_ms = 8;
-static int mic_cfg = 2; /* capture channels opened: 2 = stereo, 1 = mono */
+static int mic_cfg = 2; 
 static int16_t conv_raw[2048];
 static int32_t conv_acc;
 static int conv_n;
@@ -217,7 +203,7 @@ static int alsa_setup(int fd) {
 static int mic_try(const char *path) {
 	int fd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
 	if (fd < 0) return -1;
-	for (int i = 0; i < 2; i++) { /* prefer stereo, fall back to mono */
+	for (int i = 0; i < 2; i++) { 
 		mic_cfg = i == 0 ? 2 : 1;
 		if (alsa_setup(fd) == 0) return fd;
 		(void)ioctl(fd, SNDRV_PCM_IOCTL_DROP, 0);
@@ -225,52 +211,123 @@ static int mic_try(const char *path) {
 	close(fd);
 	return -1;
 }
-/* capture-PCM names under /dev/snd are pcmC<card>D<dev><c|p>; card/device
- * numbers are per-machine, so enumerate the directory instead of a
- * hard-coded grid */
+
+static int pcm_nums(const char *nm, size_t nl, unsigned *card, unsigned *dev) {
+	unsigned c = 0, d = 0;
+	size_t i = 4; 
+	if (nl < 8 || nl > 15) return -1;
+	while (i < nl && nm[i] >= '0' && nm[i] <= '9')
+		c = c * 10 + (unsigned)(nm[i++] - '0');
+	if (i >= nl || nm[i] != 'D') return -1;
+	i++;
+	if (i >= nl) return -1;
+	while (i < nl && nm[i] >= '0' && nm[i] <= '9')
+		d = d * 10 + (unsigned)(nm[i++] - '0');
+	if (i + 1 != nl || nm[i] != 'c') return -1;
+	*card = c;
+	*dev = d;
+	return 0;
+}
 static int mic_scan(void) {
-	/* raw getdents64(2): opendir(3) mallocs a DIR — no heap, ever.
-	 * kernel struct linux_dirent64: u64 ino, s64 off, u16 reclen,
-	 * u8 type, char name[]; name NUL-terminated, padded to reclen. */
+	
 	int dfd = open("/dev/snd", O_RDONLY|O_DIRECTORY|O_CLOEXEC);
 	if (dfd < 0) return -1;
+	char cand[16][16];
+	unsigned key[16];
+	int n = 0;
 	char buf[512];
 	for (;;) {
 		long r = syscall(SYS_getdents64, dfd, buf, sizeof buf);
 		if (r <= 0) break;
 		for (long o = 0; o < r; ) {
-			unsigned rlen;
-			memcpy(&rlen, buf + o + 16, 2); /* unaligned-safe */
+			
+			unsigned short rlen;
+			memcpy(&rlen, buf + o + 16, sizeof rlen); 
 			if (!rlen || o + rlen > r) break;
 			unsigned type = (unsigned char)buf[o + 18];
 			const char *nm = buf + o + 19;
 			size_t nl = strnlen(nm, rlen - 19);
-			if (nl < rlen - 19 && nl >= 8 && nl + 10 <= 64 &&
+			if (rlen > 19 && nl < (size_t)(rlen - 19) && nl >= 8 && nl < sizeof cand[0] &&
 			    memcmp(nm, "pcm", 3) == 0 && nm[3] == 'C' &&
-			    nm[nl-1] == 'c' && type != DT_DIR) {
-				char p[64];
-				memcpy(p, "/dev/snd/", 9);
-				memcpy(p+9, nm, nl+1);
-				int fd = mic_try(p);
-				if (fd >= 0) { close(dfd); return fd; }
+			    nm[nl-1] == 'c' && type != DT_DIR && n < 16) {
+				unsigned c, d;
+				if (pcm_nums(nm, nl, &c, &d) == 0) {
+					memcpy(cand[n], nm, nl + 1);
+					key[n] = c * 256 + d;
+					n++;
+				}
 			}
 			o += rlen;
 		}
 	}
 	close(dfd);
-	return -1;
+	for (;;) { 
+		int bi = -1;
+		for (int i = 0; i < n; i++)
+			if (key[i] != ~0u && (bi < 0 || key[i] < key[bi])) bi = i;
+		if (bi < 0) return -1;
+		key[bi] = ~0u;
+		char p[64];
+		memcpy(p, "/dev/snd/", 9);
+		{
+			size_t l = strlen(cand[bi]);
+			if (9 + l + 1 > sizeof p) continue;
+			memcpy(p+9, cand[bi], l+1);
+		}
+		int fd = mic_try(p);
+		if (fd >= 0) return fd;
+	}
+}
+static int mic_spawn(char *const argv[], pid_t *out_pid) {
+	int fds[2];
+	if (pipe(fds) != 0) return -1;
+	pid_t p = fork();
+	if (p < 0) { close(fds[0]); close(fds[1]); return -1; }
+	if (p == 0) {
+		dup2(fds[1], 1);
+		close(fds[0]); close(fds[1]);
+		execvp(argv[0], argv);
+		_exit(127);
+	}
+	close(fds[1]);
+	int fl = fcntl(fds[0], F_GETFL, 0);
+	if (fl >= 0) fcntl(fds[0], F_SETFL, fl|O_NONBLOCK);
+	*out_pid = p;
+	return fds[0];
+}
+
+static int mic_fallback_one(char *const argv[]) {
+	pid_t p = -1;
+	int fd = mic_spawn(argv, &p);
+	if (fd < 0) return -1;
+	struct timespec ts = { 0, 300000000 };
+	nanosleep(&ts, 0);
+	if (p < 0 || kill(p, 0) != 0) { close(fd); return -1; }
+	return fd;
+}
+static int mic_fallback(void) {
+	char *const a1[] = { "parec", "--raw", "--format=s16le", "--rate=48000", "--channels=1", 0 };
+	char *const a2[] = { "arecord", "-q", "-D", "default", "-f", "S16_LE", "-r", "48000", "-c", "1", "-t", "raw", "-", 0 };
+	char *const a3[] = { "pw-record", "--format=s16", "--rate=48000", "--channels=1", "-", 0 };
+	int fd = -1;
+	if (on_path("parec")) fd = mic_fallback_one(a1);
+	if (fd < 0 && on_path("arecord")) fd = mic_fallback_one(a2);
+	if (fd < 0 && on_path("pw-record")) fd = mic_fallback_one(a3);
+	if (fd < 0) return -1;
+	mic_cfg = 1;
+	eput("transcriber: mic fallback 48k mono (sound server)\n");
+	return fd;
 }
 static int mic_open(void) {
-	int fd = mic_try(g_alsadev);
-	if (fd < 0) fd = mic_scan();
+	int fd = mic_scan();
 	if (fd >= 0) {
 		eput(mic_cfg == 2 ? "transcriber: mic 48k stereo -> 16k mono\n"
 		                  : "transcriber: mic 48k mono -> 16k mono\n");
 		return fd;
 	}
-	eput("transcriber: no usable mic (");
-	eput(g_alsadev);
-	eput(")\n");
+	fd = mic_fallback();
+	if (fd >= 0) return fd;
+	eput("transcriber: no usable mic (need audio group or busy device?)\n");
 	exit(2);
 	return -1;
 }
@@ -283,8 +340,7 @@ static int ev_autoscan(int *fds) {
 		*pe = 0;
 		int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
 		if (fd < 0) continue;
-		/* KEY_MAX = 0x2ff: bitmap must cover the whole keycode space, not
-		 * just 512 bits, or g_keycode indexing reads past the array */
+		
 		unsigned long bits[(KEY_MAX + 1 + 7) / 8 / sizeof(long)] = { 0 };
 		if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof bits), bits) < 0) {
 			close(fd);
@@ -294,7 +350,7 @@ static int ev_autoscan(int *fds) {
 			close(fd);
 			continue;
 		}
-		/* no EVIOCGRAB: keep keyboard usable by X/apps */
+		
 		fds[n++] = fd;
 	}
 	return n;
@@ -333,115 +389,18 @@ static void tls_profile_init(const char *host) {
 		br_ssl_engine_set_session_parameters(&g_sess.sc.eng, &g_tls_sess);
 	br_ssl_client_reset(&g_sess.sc, host, g_tls_sess_valid);
 }
-static uint16_t rd16(const unsigned char *p) { return (uint16_t)((p[0]<<8)|p[1]); }
-static int dns_skip(const unsigned char *m, size_t n, int off) {
-	int j = 0;
-	while (off < (int)n) {
-		unsigned c = m[off];
-		if ((c&0xC0)==0xC0) { if (off+1 >= (int)n || ++j > 8) return -1; return off+2; }
-		if (c == 0) return off+1;
-		off += 1+c;
-	}
-	return -1;
-}
-/* all IPv4 nameservers from /etc/resolv.conf, in order; no hard-coded
- * fallback resolver (the old 127.0.0.53 default only works with
- * systemd-resolved's stub listener) */
-static int dns_nameservers(struct sockaddr_in *out, int max) {
-	int f = open("/etc/resolv.conf", O_RDONLY|O_CLOEXEC);
-	if (f < 0) return 0;
-	char rb[2048];
-	ssize_t r = read(f, rb, sizeof rb-1);
-	close(f);
-	if (r <= 0) return 0;
-	rb[r] = 0;
-	int n = 0;
-	for (char *ln = rb; ln && n < max; ) {
-		char *eol = strchr(ln, '\n');
-		if (eol) *eol = 0;
-		while (*ln == ' ' || *ln == '\t') ln++;
-		if (strncmp(ln, "nameserver", 10) == 0 && (ln[10] == ' ' || ln[10] == '\t')) {
-			ln += 11;
-			while (*ln == ' ' || *ln == '\t') ln++;
-			char *e = ln;
-			while (*e && *e != ' ' && *e != '\t') e++;
-			char sv = *e;
-			*e = 0;
-			if (inet_pton(AF_INET, ln, &out[n].sin_addr) == 1) {
-				out[n].sin_family = AF_INET;
-				out[n].sin_port = htons(53);
-				n++;
-			}
-			*e = sv;
-		}
-		ln = eol ? eol+1 : 0;
-	}
-	return n;
-}
+
 static int dns_resolve(const char *host, struct sockaddr_storage *dst, socklen_t *dstlen) {
-	struct sockaddr_in ns4[4];
-	int nns = dns_nameservers(ns4, 4);
-	if (nns <= 0) return -1;
-	unsigned char q[512], a[512];
-	memset(q, 0, 12);
-	uint16_t id = 0;
-	getrandom(&id, sizeof id, 0);
-	if (!id) id = 0x5eed;
-	q[0] = (unsigned char)(id>>8); q[1] = (unsigned char)id;
-	q[2] = 1;
-	q[4] = 0; q[5] = 1;
-	unsigned char *p = q+12;
-	const char *s = host;
-	for (;;) {
-		const char *d = strchr(s, '.');
-		size_t l = d ? (size_t)(d-s) : strlen(s);
-		if (!l || l > 63 || (size_t)(p-q)+l+5 > sizeof q) return -1;
-		*p++ = (unsigned char)l;
-		memcpy(p, s, l);
-		p += l;
-		if (!d) break;
-		s = d+1;
-	}
-	*p++ = 0; *p++ = 0; *p++ = 1; *p++ = 0; *p++ = 1;
-	size_t ql = (size_t)(p-q);
-	int so = socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC, 0);
-	if (so < 0) return -1;
-	struct pollfd pf = { so, POLLOUT, 0 };
-	for (int at = 0; at < 2; at++) {
-	  for (int k = 0; k < nns; k++) {
-		if (poll(&pf, 1, 2500) <= 0) continue;
-		if (sendto(so, q, ql, 0, (struct sockaddr *)&ns4[k], sizeof ns4[k]) != (ssize_t)ql) continue;
-		pf.events = POLLIN;
-		if (poll(&pf, 1, 2500) <= 0) { pf.events = POLLOUT; continue; }
-		ssize_t rl = recv(so, a, sizeof a, 0);
-		pf.events = POLLOUT;
-		if (rl < 12 || a[0] != q[0] || a[1] != q[1] || (a[3]&0x0F) || !(a[2]&0x80)) continue;
-		int off = dns_skip(a, (size_t)rl, 12);
-		if (off < 0 || off+4 > rl) continue;
-		off += 4;
-		unsigned an = rd16(a+6);
-		for (unsigned i = 0; i < an && off+10 <= rl; i++) {
-			int no = dns_skip(a, (size_t)rl, off);
-			if (no < 0 || no+10 > rl) break;
-			uint16_t t = rd16(a+no), dl = rd16(a+no+8);
-			off = no+10;
-			if (off+dl > rl) break;
-			if (t == 1 && dl == 4) {
-				struct sockaddr_in *v = (void *)dst;
-				memset(v, 0, sizeof *v);
-				v->sin_family = AF_INET;
-				v->sin_port = htons(443);
-				memcpy(&v->sin_addr, a+off, 4);
-				*dstlen = sizeof *v;
-				close(so);
-				return 0;
-			}
-			off += dl;
-		}
-	  }
-	}
-	close(so);
-	return -1;
+	struct addrinfo h;
+	memset(&h, 0, sizeof h);
+	h.ai_family = AF_UNSPEC;
+	h.ai_socktype = SOCK_STREAM;
+	struct addrinfo *r = 0;
+	if (getaddrinfo(host, "443", &h, &r) != 0 || !r) return -1;
+	memcpy(dst, r->ai_addr, r->ai_addrlen);
+	*dstlen = r->ai_addrlen;
+	freeaddrinfo(r);
+	return 0;
 }
 static int json_get_text(const char *js, size_t n, char *out, size_t cap) {
 	size_t o = 0;
@@ -607,27 +566,24 @@ static int tx_build_parts(void) {
 static int transmit(int mfd, uint32_t wav_data_len) {
 	uint32_t wav_total = WAV_HDR_LEN + wav_data_len;
 	unsigned long long body_len = (unsigned long long)part1_len+wav_total+(sizeof part_tail-1);
-	/* bounded appends: req holds the API key, so it must never overflow
-	 * and is wiped the moment it has been handed to TLS */
+	
 	#define APP(s) do { size_t L = sizeof(s)-1; if (rp + L > rend) goto fail; \
 		memcpy(rp, s, L); rp += L; } while (0)
 	#define APPV(s) do { size_t L = strlen(s); if (rp + L > rend) goto fail; \
 		memcpy(rp, s, L); rp += L; } while (0)
 	char req[2048], *rp = req, *rend = req + sizeof req;
-	int fd = -1;	/* every failure funnels to fail:, which closes and wipes */
+	int fd = -1;	
 	APP("POST ");
 	APPV(g_epath);
 	APP(" HTTP/1.1\r\nHost: ");
 	APPV(g_host);
 	APP("\r\nAuthorization: Bearer ");
-	APPV(g_apikey);	/* NUL-terminated, startup-length-capped */
+	APPV(g_apikey);	
 	APP("\r\nContent-Type: multipart/form-data; boundary=" BOUNDARY "\r\nContent-Length: ");
 	{
-		char kb[24], *kp = kb + sizeof kb;
-		*--kp = 0;
-		if (!body_len) *--kp = '0';
-		while (body_len) { *--kp = (char)('0' + body_len % 10); body_len /= 10; }
-		APPV(kp);
+		char kb[24];
+		*app_u64(kb, body_len) = 0;
+		APPV(kb);
 	}
 	APP("\r\nConnection: close\r\n\r\n");
 	#undef APP
@@ -635,8 +591,7 @@ static int transmit(int mfd, uint32_t wav_data_len) {
 	size_t rl = (size_t)(rp - req);
 	fd = socket(g_dst.ss_family, SOCK_STREAM|SOCK_CLOEXEC, 0);
 	if (fd < 0) goto fail;
-	{	/* send each finished TLS record at once; Nagle would park the
-	 * tail segment until an RTT-elapsed ACK — free latency for us */
+	{	
 		int one = 1;
 		(void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
 	}
@@ -655,7 +610,7 @@ static int transmit(int mfd, uint32_t wav_data_len) {
 		goto fail;
 	long long until = now_ms() + 45000;
 	if (tls_handshake(&g_sess.sc.eng, fd, now_ms()+12000) != 0) {
-		g_tls_sess_valid = 0;	/* poison guard: never reuse a dead session */
+		g_tls_sess_valid = 0;	
 		goto fail;
 	}
 	br_ssl_engine_get_session_parameters(&g_sess.sc.eng, &g_tls_sess);
@@ -676,7 +631,7 @@ static int transmit(int mfd, uint32_t wav_data_len) {
 	}
 	if (tls_send_all(&g_sess.sc.eng, fd, (unsigned char *)part_tail, sizeof part_tail-1, until) != 0)
 		goto fail;
-	explicit_bzero(req, sizeof req);	/* key handled: no residue */
+	explicit_bzero(req, sizeof req);	
 	ssize_t rl2 = tls_read_all(&g_sess.sc.eng, fd, g_sess.resp, sizeof g_sess.resp, until);
 	close(fd);
 	fd = -1;
@@ -689,7 +644,7 @@ static int transmit(int mfd, uint32_t wav_data_len) {
 			code = (s[9]-'0')*100+(s[10]-'0')*10+(s[11]-'0');
 	}
 	if (code != 200)
-		return code;	/* main logs one short line; positive = server reply */
+		return code;	
 	const char *body = strstr(g_sess.resp, "\r\n\r\n");
 	if (!body) goto fail;
 	body += 4;
@@ -699,7 +654,7 @@ static int transmit(int mfd, uint32_t wav_data_len) {
 	return 0;
 fail:
 	if (fd >= 0) close(fd);
-	explicit_bzero(req, sizeof req);	/* carry no key residue out of a failed send */
+	explicit_bzero(req, sizeof req);	
 	return -1;
 }
 static int on_path(const char *name) {
@@ -722,10 +677,7 @@ static int on_path(const char *name) {
 	return 0;
 }
 static void paste_at_cursor(const char *text) {
-	/* xclip/xdotool are X11-only; skip paste under Wayland or when the
-	 * helpers are not on PATH, instead of silently typing nothing.
-	 * XWayland sessions export DISPLAY too, so WAYLAND_DISPLAY alone is
-	 * not proof of Wayland: XDG_SESSION_TYPE is the primary signal. */
+	
 	const char *st = getenv("XDG_SESSION_TYPE");
 	int wl = (st && !strcmp(st, "wayland")) ||
 	         (getenv("WAYLAND_DISPLAY") && !getenv("DISPLAY"));
@@ -743,6 +695,9 @@ static void paste_at_cursor(const char *text) {
 	}
 	if (fork() != 0) _exit(0);
 	{
+		
+		int dn = open("/dev/null", O_WRONLY|O_CLOEXEC);
+		if (dn >= 0) { dup2(dn, 1); if (dn != 1) close(dn); }
 		int fds[2];
 		if (pipe(fds) != 0) _exit(0);
 		pid_t x = fork();
@@ -760,12 +715,7 @@ static void paste_at_cursor(const char *text) {
 			int s;
 			while (waitpid(x, &s, 0) < 0 && errno == EINTR) ;
 		}
-		/* paste only once the clipboard really holds the transcript:
-		 * the old fixed 50 ms sleep raced xclip's ownership transfer
-		 * and could paste stale clipboard content into the wrong window.
-		 * xclip -o round-trip = the selection is actually served.
-		 * probe immediately, then 10 ms steps up to a 2 s cap: the
-		 * common case costs one xclip exec, not a fixed sleep */
+		
 		{
 			char probe[256];
 			size_t want = strlen(text);
@@ -799,7 +749,7 @@ static void paste_at_cursor(const char *text) {
 				struct timespec ts = { 0, 10000000 };
 				nanosleep(&ts, 0);
 			}
-			if (!ok) _exit(0);	/* never confirmed: paste nothing */
+			if (!ok) _exit(0);	
 		}
 		pid_t d = fork();
 		if (d == 0) {
@@ -834,9 +784,6 @@ static int do_press(int *evfds, int nev, int pcm, long long t0, uint32_t *out_le
 		if (r < 0 && errno != EINTR) break;
 		for (int i = 0; i < nev; i++) {
 			if (pf[i].revents & (POLLERR|POLLHUP|POLLNVAL)) goto released;
-			if (!(pf[i].revents & POLLIN)) continue;
-		}
-		for (int i = 0; i < nev; i++) {
 			if (!(pf[i].revents & POLLIN)) continue;
 			struct input_event ev;
 			ssize_t n;
@@ -892,20 +839,28 @@ static void usage(void) {
 }
 int main(int argc, char **argv) {
 	(void)argv;
-	if (argc > 1) {	/* no flags exist; fail fast on stray arguments */
+	if (argc > 1) {	
 		usage();
 		return 1;
 	}
 	signal(SIGPIPE, SIG_IGN);
+	signal(SIGCHLD, SIG_IGN); 
 	key_init();
-	if (dns_resolve(g_host, &g_dst, &g_dstlen) != 0) { eput("transcriber: DNS resolve failed (phase 0): "); eput(g_host); eput("\n"); return 1; }
+	int dns_tries = 0;
+	while (dns_resolve(g_host, &g_dst, &g_dstlen) != 0) {
+		if (++dns_tries >= 3) { eput("transcriber: DNS resolve failed (phase 0): "); eput(g_host); eput("\n"); return 1; }
+		struct timespec ts = { 2, 0 };
+		nanosleep(&ts, 0);
+	}
 	eput("transcriber: dns ok\n");
 	if (tx_build_parts() != 0) die("provider config too long");
 	int pcm = mic_open();
 	int evfds[MAX_EVENTS];
 	int nev = ev_autoscan(evfds);
-	if (!nev) die("no key-capable event device found");
+	if (!nev) die("no key-capable event device found (need input group?)");
 	eput("transcriber: ready\n");
+	if (!on_path("xclip") || !on_path("xdotool"))
+		eput("transcriber: no xclip/xdotool on PATH (paste will skip)\n");
 	struct pollfd pf[MAX_EVENTS];
 	for (int i = 0; i < nev; i++) {
 		pf[i].fd = evfds[i];
@@ -914,7 +869,7 @@ int main(int argc, char **argv) {
 	for (;;) {
 		if (poll(pf, (nfds_t)nev, -1) < 0) {
 			if (errno == EINTR) continue;
-			/* runtime failure: never exit — report, wait, retry */
+			
 			eput("transcriber: poll failed, retrying\n");
 			struct timespec ts = { 1, 0 };
 			nanosleep(&ts, 0);
@@ -922,7 +877,7 @@ int main(int argc, char **argv) {
 		}
 		for (int i = 0; i < nev; i++) {
 			if (pf[i].revents & (POLLERR|POLLHUP|POLLNVAL)) {
-				/* device vanished: drop it, rescan; never exit */
+				
 				eput("transcriber: input device lost, rescanning\n");
 				close(evfds[i]);
 				for (int j = i; j + 1 < nev; j++) {
@@ -944,9 +899,9 @@ int main(int argc, char **argv) {
 				uint32_t wlen = 0;
 				int mfd = do_press(evfds, nev, pcm, t, &wlen);
 				if (mfd < 0) { session_drop(); continue; }
-				{	/* one short line per failure, nothing on success */
+				{	
 					int r = transmit(mfd, wlen);
-					if (r > 0) {	/* server said no: r = HTTP status */
+					if (r > 0) {	
 						eput("transcriber: HTTP ");
 						{
 							char b[3];
@@ -965,7 +920,7 @@ int main(int argc, char **argv) {
 			}
 		}
 		if (nev == 0) {
-			/* all inputs gone: rescan until one reappears, never exit */
+			
 			while ((nev = ev_autoscan(evfds)) == 0) {
 				struct timespec ts = { 1, 0 };
 				nanosleep(&ts, 0);

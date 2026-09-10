@@ -6,7 +6,7 @@ BEAR_URL="https://www.bearssl.org/bearssl-${BEAR_VER}.tar.gz"
 BEAR_SHA256="6705bba1714961b41a728dfc5debbe348d2966c117649392f8c8139efc83ff14"
 CC="${CC:-musl-gcc}"
 need() { command -v "$1" >/dev/null 2>&1 || { echo "build.sh: need $1" >&2; exit 1; }; }
-need "$CC" strip sha256sum stat file cut tr systemctl
+need "$CC" strip sha256sum stat file cut tr
 mkdir -p build
 if [ ! -d build/bearssl ]; then
   need curl tar
@@ -49,5 +49,5 @@ install_bin="${HOME:?}/.local/bin"
 mkdir -p "$install_bin"
 cp build/transcriber "$install_bin/transcriber.new"
 mv -f "$install_bin/transcriber.new" "$install_bin/transcriber"
-systemctl restart --user transcriber
+if command -v systemctl >/dev/null 2>&1; then systemctl restart --user transcriber || echo "build.sh: installed, but service restart failed (enable/start manually)" >&2; else echo "build.sh: installed, no systemctl (non-systemd: start manually)" >&2; fi
 echo "OK: installed and restarted $install_bin/transcriber ($(stat -c%s "$install_bin/transcriber") bytes static: $(file -b "$install_bin/transcriber" | cut -c1-80))"

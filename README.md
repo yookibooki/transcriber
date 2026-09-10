@@ -37,24 +37,35 @@ Env config (env-only; no provider flags). Defaults in parens:
 
 Any OpenAI-compatible `/audio/transcriptions` endpoint works without recompile. TLS still trusts **only `anchors/`** — a provider whose chain terminates elsewhere handshake-fails by design; adding a root to `anchors/` is a trust-policy change (ask-first).
 
-No flags. Autoscan only: Right Ctrl from any `eventN` device that has that keycode (kernel `EVIOCGBIT` query), mic from `/dev/snd/pcmC0D0c`, else any `pcmC*D*c` under `/dev/snd`. Right Ctrl is the only hotkey — there is no keycode option either.
+No flags. Autoscan only: Right Ctrl from any `eventN` device that has that keycode (kernel `EVIOCGBIT` query), mic from lowest-numbered `pcmC*D*c` capture device under `/dev/snd` (fully discovered, no hard-coded card). Right Ctrl is the only hotkey — there is no keycode option either.
 
 Runtime deps: paste needs `xclip` + `xdotool` on PATH (X11; skipped when the session is Wayland, incl. `XDG_SESSION_TYPE=wayland`); `/dev/input/` + `/dev/snd/` access (input + audio groups or root); DNS from `/etc/resolv.conf`.
 
+## Setup on a new machine
+
+```sh
+sudo usermod -aG input,audio $USER   # then re-login; needed for /dev/input/event* + /dev/snd/*
+# Debian/Ubuntu: sudo apt install xclip xdotool
+# Fedora:        sudo dnf install xclip xdotool
+# Arch:          sudo pacman -S xclip xdotool
+```
+
+Notes: PipeWire/Pulse boxes work with no extra config (sound-server fallback is automatic — verified against real PipeWire). Paste sends `ctrl+shift+v`. `DISPLAY`/`XAUTHORITY` come from the systemd user manager environment — no per-display config.
+
 ## Behavior
 
-- Mic opens 48 kHz stereo S16 LE (mono fallback), downsampled 3:1 to 16 kHz mono WAV in-code.
+- Mic opens 48 kHz stereo S16 LE (mono fallback), downsampled 3:1 to 16 kHz mono WAV in-code. If hw is busy (PipeWire/Pulse), falls back to first available `parec` / `arecord` / `pw-record` (48k mono raw).
 - Hold < 300 ms: ignored, no network. Cap 60 s per press. HTTP response cap 8 KB; transcript cap 4 KB.
 - No `EVIOCGRAB` — keyboard stays fully usable.
 - Clipboard paste: only after `xclip -o` confirms the transcript is actually served (up to 2 s, then skip) — replaces a fixed 50 ms race. Clipboard content is still overwritten by design.
 - After each send, the request buffer (which contains the API key) is zeroed, and session memory (`g_sess`: TLS state, keys, transcript buffers) is wiped via `madvise(MADV_DONTNEED)`; `sizeof g_sess` is compile-time asserted to be a page multiple so the wipe stays exact.
-- Own DNS (raw UDP to all IPv4 nameservers in resolv.conf, in order) and own TLS 1.2 client (ECDHE AES-GCM suites only, pinned anchors as a compiled-in table — never a system store). TLS session-ID resumption keeps the handshake state between sends (user-approved): repeat dictations do an abbreviated handshake; if the server refuses, it falls back to a full handshake automatically.
+- System DNS via `getaddrinfo` (hosts/NSS/CNAME/v4+v6) and own TLS 1.2 client (ECDHE AES-GCM suites only, pinned anchors as a compiled-in table — never a system store). TLS session-ID resumption keeps the handshake state between sends (user-approved): repeat dictations do an abbreviated handshake; if the server refuses, it falls back to a full handshake automatically.
 - The daemon never exits at runtime: poll errors retry after 1s, dead input devices are dropped/re-scanned, record failures discard the capture silently. A rejected send logs one line: `transcriber: HTTP 429` (server status) or `transcriber: send failed` (transport). Exit codes 1 (bad env/DNS, stray arguments) and 2 (no mic) are startup-only fail-fast; the anchor table is a build-time artifact, so it cannot fail at runtime.
 - Transcript is delivered only by cursor-paste (stdout is never written; on a per-send basis journald must not hold your dictations).
 
 ## Autostart (systemd user service)
 
-`~/.config/systemd/user/transcriber.service` — enabled, runs `~/.local/bin/transcriber` after `graphical-session.target` with `DISPLAY=:0`, `XAUTHORITY`, and `TRANSCRIBE_API_KEY` (in `~/.config/environment.d/transcribe.conf`, mode 0600) with `Restart=always`. Manage:
+`~/.config/systemd/user/transcriber.service` — enabled, runs `~/.local/bin/transcriber` after `graphical-session.target` + `network-online.target` (`DISPLAY`/`XAUTHORITY` inherited from the user manager environment) with `TRANSCRIBE_API_KEY` (in `~/.config/environment.d/transcribe.conf`, mode 0600) with `Restart=always`. Manage:
 
 ```sh
 systemctl --user status|restart|stop transcriber.service
