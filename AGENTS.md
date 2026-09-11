@@ -14,5 +14,5 @@ Philosophy: extreme efficiency, idiomatic C — minimal RAM / binary / LOC / sys
 
 Build: `./build.sh`
 
-## Tests
-Agents run no tests. Build and ask user to test.
+## e2e testing
+Build then ask user to test.

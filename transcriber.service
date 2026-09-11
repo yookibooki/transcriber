@@ -1,0 +1,55 @@
+[Unit]
+Description=Push-to-talk transcriber daemon (hold Right Ctrl to transcribe)
+After=graphical-session.target network-online.target
+Wants=network-online.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/transcriber
+Restart=always
+RestartSec=1
+EnvironmentFile=-%h/.config/environment.d/transcribe.conf
+
+# --- Hardening for user service (tested 2026-09-11, systemd 261) ---
+NoNewPrivileges=yes
+# Must stay 'no': X11 paste needs /tmp/.X11-unix/X0 (yes hides it, verified)
+PrivateTmp=no
+ProtectSystem=strict
+ProtectHome=read-only
+
+# Device access: need /dev/input and /dev/snd
+# Must stay 'no': 'yes'+closed hides nodes even with DeviceAllow (verified:
+# /dev/input/event0 + /dev/snd/pcmC0D0c vanish, mic+keys break)
+PrivateDevices=no
+DeviceAllow=/dev/input/event* rw
+DeviceAllow=/dev/snd/* rw
+
+# Further restrictions
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+# Keep ioctl, socket, etc for ALSA and input
+SystemCallFilter=@system-service @raw-io
+SystemCallFilter=~@privileged @resources @mount
+
+# Resource limits
+LimitCORE=0
+LimitNOFILE=64
+
+# Do not let systemd store our transcript in journal with high level
+# (transcript only via paste, stdout never written)
+StandardOutput=null
+StandardError=journal
+LogRateLimitIntervalSec=0
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,9 +1,7 @@
 #define _GNU_SOURCE
-/* transcriber: hold RightCtrl -> record 48k->16k mono -> Groq Whisper -> paste at cursor.
-   Pipeline: evdev poll (idle, 0 wakeups) -> memfd WAV -> TLS1.2/BearSSL -> xclip/xdotool.
-   Single file, no heap in hot path; g_sess is page-aligned and MADV_DONTNEEDed per press. */
 #include <string.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -13,12 +11,15 @@
 #include <poll.h>
 #include <stdio.h>
 #include <dirent.h>
+#include <ctype.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
+#include <sys/prctl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <netdb.h>
@@ -27,185 +28,338 @@
 #include <bearssl.h>
 #include "ta.h"
 
-#define MAX_EVENTS 8
-#define SAMPLE_RATE 16000
-#define CHANNELS 1
-#define PCM_SAMPLES 2048
-#define PRESS_MIN_MS 300
-#define PRESS_MAX_MS 60000
-#define MAX_WAV_DATA (60u*16000u*2u)
-#define WAV_HDR_LEN 44
-#define RESP_MAX 8192
-#define TEXT_MAX 4096
+enum {
+    SAMPLE_RATE = 16000,
+    INPUT_RATE = 48000,
+    CHANNELS = 1,
+    PCM_FRAMES = 1024,
+    PRESS_MIN_MS = 300,
+    PRESS_MAX_MS = 60000,
+    MAX_WAV_DATA = 60u * 16000u * 2u,
+    WAV_HDR_SIZE = 44,
+    RESP_MAX = 8192,
+    TEXT_MAX = 4096,
+    HOST_MAX = 128,
+    MODEL_MAX = 64,
+    LANG_MAX = 16,
+    EPATH_MAX = 192,
+    APIKEY_MAX = 512,
+    MAX_INPUT_DEVS = 8,
+    MAX_REMOTES = 1,
+};
+
+static const int KEY_CODE = KEY_RIGHTCTRL;
 #define BOUNDARY "wzp0boundary7f3a1c9e"
-#define HOST_MAX 128
-#define MODEL_MAX 64
-#define LANG_MAX 16
-#define EPATH_MAX 192
-#define APIKEY_MAX 512
+static const char MULTIPART_TAIL[] = "\r\n--" BOUNDARY "--\r\n";
 
-static const int g_keycode = KEY_RIGHTCTRL;
-
-static struct __attribute__((aligned(4096))) session {
-    br_ssl_client_context sc;
-    br_x509_minimal_context xc;
-    unsigned char tlsbuf[BR_SSL_BUFSIZE_BIDI];
-    char resp[RESP_MAX];
-    char tout[TEXT_MAX];
-    int16_t pcmbuf[PCM_SAMPLES];
-} g_sess;
-_Static_assert(sizeof g_sess % 4096 == 0, "page multiple");
-
-static char g_apikey[APIKEY_MAX];
-static char g_host[HOST_MAX] = "api.groq.com";
-static char g_model[MODEL_MAX] = "whisper-large-v3-turbo";
-static char g_lang[LANG_MAX] = "en";
-static char g_epath[EPATH_MAX] = "/openai/v1/audio/transcriptions";
-
-static struct sockaddr_storage g_dst;
-static socklen_t g_dstlen;
-static br_ssl_session_parameters g_tls_sess;
-static unsigned g_tls_sess_valid;
-
-// mic downsample state: 48k -> 16k (/3) + stereo->mono
-static int g_mic_cfg = 2; // 2 stereo, 1 mono
-static int16_t conv_raw[2048];
-static int32_t conv_acc;
-static int conv_n;
-
-static char part1_head[512];
-static size_t part1_len;
-static const char part_tail[] = "\r\n--" BOUNDARY "--\r\n";
-
-static const uint16_t tls_suites[] = {
+static const uint16_t TLS_SUITES[] = {
     BR_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
     BR_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
     BR_TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
     BR_TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
 };
 
-/* utils */
-static ssize_t write_all(int fd, const void *b, size_t n) {
-    const unsigned char *p = b;
+typedef struct {
+    char api_key[APIKEY_MAX];
+    char host[HOST_MAX];
+    char model[MODEL_MAX];
+    char lang[LANG_MAX];
+    char epath[EPATH_MAX];
+} Config;
+
+typedef struct {
+    int channels;
+    int32_t acc;
+    int pending;
+    int16_t raw[1024];
+} Resampler;
+
+typedef struct __attribute__((aligned(4096))) {
+    br_ssl_client_context sc;
+    br_x509_minimal_context xc;
+    unsigned char iobuf[BR_SSL_BUFSIZE_MONO];
+    char resp[RESP_MAX];
+    char transcript[TEXT_MAX];
+} TlsContext;
+
+_Static_assert(sizeof(TlsContext) % 4096 == 0, "tls context must be page multiple");
+
+static Config g_cfg = {
+   .host = "api.groq.com",
+   .model = "whisper-large-v3-turbo",
+   .lang = "en",
+   .epath = "/openai/v1/audio/transcriptions",
+};
+
+static TlsContext g_tls;
+static struct sockaddr_storage g_remotes[MAX_REMOTES];
+static socklen_t g_remote_lens[MAX_REMOTES];
+static int g_remote_count = 0;
+
+static Resampler g_resampler;
+static char g_multipart_head[512];
+static size_t g_multipart_head_len;
+
+static const struct {
+    const char *name;
+    time_t expires;
+} g_anchor_info[] = {
+    {"ISRG Root X1", 2064567878},
+    {"ISRG Root X2", 2231510400},
+    {"GTS Root R4",  2097705600},
+};
+
+static ssize_t write_all(int fd, const void *buf, size_t len) {
+    const uint8_t *p = buf;
     size_t off = 0;
-    while (off < n) {
-        ssize_t w = write(fd, p + off, n - off);
-        if (w < 0) {
+    while (off < len) {
+        ssize_t n = write(fd, p + off, len - off);
+        if (n < 0) {
             if (errno == EINTR) continue;
             return -1;
         }
-        off += w;
+        off += (size_t)n;
     }
-    return off;
-}
-static void eput(const char *s) { write_all(2, s, strlen(s)); }
-static void die(const char *m) { eput("transcriber: "); eput(m); eput("\n"); exit(1); }
-static long long now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
-}
-static void sleep_ms(long ms) {
-    struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
-    nanosleep(&ts, 0);
-}
-static void wait_quiet(pid_t pid) {
-    int st;
-    while (waitpid(pid, &st, 0) < 0 && errno == EINTR);
-}
-static void poll_init(struct pollfd *pf, int *fds, int n) {
-    for (int i = 0; i < n; i++) { pf[i].fd = fds[i]; pf[i].events = POLLIN; }
-}
-static int on_path(const char *name) {
-    const char *pv = getenv("PATH");
-    if (!pv || !*pv) pv = "/usr/bin:/bin";
-    size_t nl = strlen(name);
-    const char *s = pv;
-    for (;;) {
-        const char *e = strchr(s, ':');
-        size_t dl = e? (size_t)(e - s) : strlen(s);
-        if (dl && dl + nl + 2 <= 256) {
-            char p[256];
-            memcpy(p, s, dl); p[dl] = '/';
-            memcpy(p + dl + 1, name, nl + 1);
-            if (access(p, X_OK) == 0) return 1;
-        }
-        if (!e) break;
-        s = e + 1;
-    }
-    return 0;
-}
-static void cfg_str(const char *name, char *dst, size_t cap) {
-    const char *e = getenv(name);
-    if (!e || !*e) return;
-    size_t n = strlen(e);
-    if (n >= cap) { eput("transcriber: "); eput(name); eput(" too long\n"); exit(1); }
-    memcpy(dst, e, n + 1);
-    explicit_bzero((char *)e, n);
-    unsetenv(name);
-}
-static void key_init(void) {
-    const char *e = getenv("TRANSCRIBE_API_KEY");
-    if (!e || !*e) die("TRANSCRIBE_API_KEY not set in environment");
-    size_t n = strlen(e);
-    if (n >= APIKEY_MAX) die("TRANSCRIBE_API_KEY too long");
-    memcpy(g_apikey, e, n + 1);
-    explicit_bzero((char *)e, n);
-    unsetenv("TRANSCRIBE_API_KEY");
-    cfg_str("TRANSCRIBE_HOST", g_host, sizeof g_host);
-    cfg_str("TRANSCRIBE_MODEL", g_model, sizeof g_model);
-    cfg_str("TRANSCRIBE_LANGUAGE", g_lang, sizeof g_lang);
-    cfg_str("TRANSCRIBE_PATH", g_epath, sizeof g_epath);
+    return (ssize_t)off;
 }
 
-/* pcm conversion: 48k -> 16k (/3) + stereo->mono.
-   Batch triples: 1 branch + 1 /3 per 3 frames instead of per-sample
-   branch. Arithmetic order (truncation) identical to scalar version. */
-static ssize_t conv_read(int pcm, int16_t *out, size_t cap) {
-    ssize_t r;
-    do { r = read(pcm, conv_raw, sizeof conv_raw); } while (r < 0 && errno == EINTR);
-    if (r <= 0) return r;
-    int32_t acc = conv_acc;
-    int n = conv_n;
-    size_t o = 0;
-    if (g_mic_cfg == 1) {
-        size_t ns = (size_t)r / 2, i = 0;
-        // align to triple boundary (<=2 scalar steps, carries acc across reads)
-        while (n && i < ns && o < cap) {
-            acc += conv_raw[i++];
-            if (++n == 3) { out[o++] = acc / 3; acc = 0; n = 0; }
+static void log_err(const char *s) {
+    write_all(STDERR_FILENO, s, strlen(s));
+}
+
+static void fatal(const char *msg) {
+    log_err("transcriber: ");
+    log_err(msg);
+    log_err("\n");
+    _exit(1);
+}
+
+static int64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static bool executable_in_path(const char *name) {
+    const char *path = getenv("PATH");
+    if (!path || !*path) path = "/usr/bin:/bin:/usr/local/bin";
+    size_t name_len = strlen(name);
+    const char *p = path;
+    for (;;) {
+        const char *colon = strchr(p, ':');
+        size_t dir_len = colon ? (size_t)(colon - p) : strlen(p);
+        if (dir_len > 0 && dir_len + name_len + 2 <= 256) {
+            char full[256];
+            memcpy(full, p, dir_len);
+            full[dir_len] = '/';
+            memcpy(full + dir_len + 1, name, name_len + 1);
+            if (access(full, X_OK) == 0) return true;
         }
-        // bulk: 3 samples -> 1 output, no per-sample branch
-        while (i + 3 <= ns && o < cap) {
-            int32_t s = (int32_t)conv_raw[i] + conv_raw[i+1] + conv_raw[i+2];
-            out[o++] = s / 3;
+        if (!colon) break;
+        p = colon + 1;
+    }
+    return false;
+}
+
+static bool contains_crlf(const char *s) {
+    return strchr(s, '\r') != NULL || strchr(s, '\n') != NULL;
+}
+static bool has_control(const char *s) {
+    for (const unsigned char *p = (const unsigned char*)s; *p; p++) {
+        if (*p < 0x20 || *p == 0x7f) return true;
+    }
+    return false;
+}
+static bool is_valid_host(const char *s) {
+    if (!s || !*s) return false;
+    if (contains_crlf(s) || has_control(s)) return false;
+    if (strchr(s, '/') || strchr(s, ' ') || strchr(s, ':') || strchr(s, '@')) return false;
+    size_t n = strlen(s);
+    if (n >= HOST_MAX) return false;
+    for (size_t i=0;i<n;i++) {
+        char c = s[i];
+        if (!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='.'||c=='-'||c=='_')) return false;
+    }
+    return true;
+}
+static bool is_valid_token(const char *s, size_t max) {
+    if (!s || !*s) return false;
+    if (contains_crlf(s) || has_control(s)) return false;
+    size_t n = strlen(s);
+    if (n >= max) return false;
+
+    for (size_t i=0;i<n;i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x21 || c > 0x7E) return false;
+        if (c == '"' || c == '\'' || c == ';') return false;
+    }
+    if (strstr(s, BOUNDARY)) return false;
+    return true;
+}
+static bool is_valid_path(const char *s) {
+    if (!s || !*s) return false;
+    if (contains_crlf(s) || has_control(s)) return false;
+    if (s[0] != '/') return false;
+    size_t n = strlen(s);
+    if (n >= EPATH_MAX) return false;
+    if (strchr(s, ' ') || strchr(s, '"')) return false;
+    if (strstr(s, BOUNDARY)) return false;
+    return true;
+}
+static bool is_valid_apikey(const char *s) {
+    if (!s || !*s) return false;
+    if (contains_crlf(s) || has_control(s)) return false;
+    size_t n = strlen(s);
+    if (n >= APIKEY_MAX) return false;
+
+    if (strchr(s, ' ') || strchr(s, '\t')) return false;
+    return true;
+}
+
+static bool load_env_copy(const char *env, char *dst, size_t cap) {
+    const char *v = getenv(env);
+    if (!v || !*v) return false;
+    size_t n = strlen(v);
+    if (n >= cap) fatal("env value too long");
+    memcpy(dst, v, n + 1);
+    explicit_bzero((char *)v, n);
+    unsetenv(env);
+    return true;
+}
+
+static void config_load(void) {
+    const char *k = getenv("TRANSCRIBE_API_KEY");
+    if (!k || !*k) fatal("TRANSCRIBE_API_KEY not set");
+    size_t n = strlen(k);
+    if (n >= sizeof(g_cfg.api_key)) fatal("TRANSCRIBE_API_KEY too long");
+    if (!is_valid_apikey(k)) fatal("TRANSCRIBE_API_KEY contains invalid chars (CRLF/control)");
+    memcpy(g_cfg.api_key, k, n + 1);
+    explicit_bzero((char *)k, n);
+    unsetenv("TRANSCRIBE_API_KEY");
+
+    char tmp_host[HOST_MAX];
+    char tmp_model[MODEL_MAX];
+    char tmp_lang[LANG_MAX];
+    char tmp_epath[EPATH_MAX];
+    bool has_host = false, has_model = false, has_lang = false, has_path = false;
+
+    memcpy(tmp_host, g_cfg.host, sizeof(tmp_host));
+    memcpy(tmp_model, g_cfg.model, sizeof(tmp_model));
+    memcpy(tmp_lang, g_cfg.lang, sizeof(tmp_lang));
+    memcpy(tmp_epath, g_cfg.epath, sizeof(tmp_epath));
+
+    has_host = load_env_copy("TRANSCRIBE_HOST", tmp_host, sizeof(tmp_host));
+    has_model = load_env_copy("TRANSCRIBE_MODEL", tmp_model, sizeof(tmp_model));
+    has_lang = load_env_copy("TRANSCRIBE_LANGUAGE", tmp_lang, sizeof(tmp_lang));
+    has_path = load_env_copy("TRANSCRIBE_PATH", tmp_epath, sizeof(tmp_epath));
+
+    if (has_host && !is_valid_host(tmp_host)) fatal("TRANSCRIBE_HOST invalid (must be hostname, no CRLF/control)");
+    if (has_model && !is_valid_token(tmp_model, sizeof(tmp_model))) fatal("TRANSCRIBE_MODEL invalid (CRLF/control/boundary)");
+    if (has_lang && !is_valid_token(tmp_lang, sizeof(tmp_lang))) fatal("TRANSCRIBE_LANGUAGE invalid");
+    if (has_path && !is_valid_path(tmp_epath)) fatal("TRANSCRIBE_PATH invalid (must start with /, no CRLF/control)");
+
+    memcpy(g_cfg.host, tmp_host, sizeof(g_cfg.host));
+    memcpy(g_cfg.model, tmp_model, sizeof(g_cfg.model));
+    memcpy(g_cfg.lang, tmp_lang, sizeof(g_cfg.lang));
+    memcpy(g_cfg.epath, tmp_epath, sizeof(g_cfg.epath));
+}
+
+static void disable_core_dumps(void) {
+    struct rlimit rl = {0,0};
+    setrlimit(RLIMIT_CORE, &rl);
+#ifdef PR_SET_DUMPABLE
+    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+#endif
+
+    if (mlock(&g_cfg, sizeof(g_cfg)) != 0) {
+
+        log_err("transcriber: warning: mlock failed for api key (no memlock limit?)\n");
+    }
+}
+
+static void secure_wipe_cfg(void) {
+    explicit_bzero(g_cfg.api_key, sizeof(g_cfg.api_key));
+}
+
+static void check_anchor_expiry(void) {
+    time_t now = time(NULL);
+    for (size_t i=0;i<sizeof(g_anchor_info)/sizeof(g_anchor_info[0]);i++) {
+        time_t exp = g_anchor_info[i].expires;
+        if (now >= exp) {
+            char buf[256];
+            snprintf(buf, sizeof(buf), "transcriber: CRITICAL: pinned anchor %s EXPIRED", g_anchor_info[i].name);
+            log_err(buf); log_err("\n");
+        }
+    }
+}
+
+static void wav_fill_header(uint8_t hdr[WAV_HDR_SIZE], uint32_t data_len) {
+    uint32_t riff_len = 36 + data_len;
+    uint32_t fmt_len = 16;
+    uint32_t sr = SAMPLE_RATE;
+    uint32_t byte_rate = SAMPLE_RATE * CHANNELS * 2;
+    uint16_t fmt = 1, ch = CHANNELS, bits = 16, block = CHANNELS * 2;
+    memcpy(hdr + 0, "RIFF", 4);
+    memcpy(hdr + 4, &riff_len, 4);
+    memcpy(hdr + 8, "WAVEfmt ", 8);
+    memcpy(hdr + 16, &fmt_len, 4);
+    memcpy(hdr + 20, &fmt, 2);
+    memcpy(hdr + 22, &ch, 2);
+    memcpy(hdr + 24, &sr, 4);
+    memcpy(hdr + 28, &byte_rate, 4);
+    memcpy(hdr + 32, &block, 2);
+    memcpy(hdr + 34, &bits, 2);
+    memcpy(hdr + 36, "data", 4);
+    memcpy(hdr + 40, &data_len, 4);
+}
+
+static ssize_t resample_read(int pcm_fd, Resampler *rs, int16_t *out, size_t cap) {
+    ssize_t r;
+    do { r = read(pcm_fd, rs->raw, sizeof(rs->raw)); } while (r < 0 && errno == EINTR);
+    if (r <= 0) return r;
+
+    int32_t acc = rs->acc;
+    int pending = rs->pending;
+    size_t written = 0;
+
+    if (rs->channels == 1) {
+        size_t samples = (size_t)r / 2;
+        size_t i = 0;
+        while (pending && i < samples && written < cap) {
+            acc += rs->raw[i++];
+            if (++pending == 3) { out[written++] = (int16_t)(acc / 3); acc = 0; pending = 0; }
+        }
+        while (i + 3 <= samples && written < cap) {
+            int32_t s = (int32_t)rs->raw[i] + rs->raw[i+1] + rs->raw[i+2];
+            out[written++] = (int16_t)(s / 3);
             i += 3;
         }
-        while (i < ns && o < cap) { acc += conv_raw[i++]; ++n; }
+        while (i < samples && written < cap) { acc += rs->raw[i++]; pending++; }
     } else {
-        size_t nf = (size_t)r / 4, i = 0;
-        int16_t *s = conv_raw;
-        while (n && i < nf && o < cap) {
+        size_t frames = (size_t)r / 4;
+        int16_t *s = rs->raw;
+        size_t i = 0;
+        while (pending && i < frames && written < cap) {
             acc += (s[2*i] + s[2*i+1]) / 2;
             i++;
-            if (++n == 3) { out[o++] = acc / 3; acc = 0; n = 0; }
+            if (++pending == 3) { out[written++] = (int16_t)(acc / 3); acc = 0; pending = 0; }
         }
-        while (i + 3 <= nf && o < cap) {
+        while (i + 3 <= frames && written < cap) {
             int32_t m0 = (s[2*i] + s[2*i+1]) / 2;
             int32_t m1 = (s[2*i+2] + s[2*i+3]) / 2;
             int32_t m2 = (s[2*i+4] + s[2*i+5]) / 2;
-            out[o++] = (m0 + m1 + m2) / 3;
+            out[written++] = (int16_t)((m0 + m1 + m2) / 3);
             i += 3;
         }
-        while (i < nf && o < cap) { acc += (s[2*i] + s[2*i+1]) / 2; i++; ++n; }
+        while (i < frames && written < cap) { acc += (s[2*i] + s[2*i+1]) / 2; i++; pending++; }
     }
-    conv_acc = acc;
-    conv_n = n;
-    return o * 2; // bytes
+
+    rs->acc = acc;
+    rs->pending = pending;
+    return (ssize_t)(written * 2);
 }
 
-/* alsa */
-static int alsa_setup(int fd, int want_ch) {
+static int alsa_hw_configure(int fd, int channels) {
     struct snd_pcm_hw_params p = {0};
     for (int i = 0; i < 3; i++) for (int w = 0; w < 8; w++) p.masks[i].bits[w] = ~0u;
     for (int i = 0; i < 12; i++) { p.intervals[i].min = 0; p.intervals[i].max = ~0u; }
@@ -213,571 +367,674 @@ static int alsa_setup(int fd, int want_ch) {
     p.masks[1].bits[0] = 1u << SNDRV_PCM_FORMAT_S16_LE;
     p.masks[2].bits[0] = 1u << SNDRV_PCM_SUBFORMAT_STD;
     for (int w = 1; w < 8; w++) p.masks[0].bits[w] = p.masks[1].bits[w] = p.masks[2].bits[w] = 0;
-
     p.intervals[SNDRV_PCM_HW_PARAM_SAMPLE_BITS-8].min = p.intervals[SNDRV_PCM_HW_PARAM_SAMPLE_BITS-8].max = 16;
-    p.intervals[SNDRV_PCM_HW_PARAM_FRAME_BITS-8].min = p.intervals[SNDRV_PCM_HW_PARAM_FRAME_BITS-8].max = 16 * want_ch;
-    p.intervals[SNDRV_PCM_HW_PARAM_CHANNELS-8].min = p.intervals[SNDRV_PCM_HW_PARAM_CHANNELS-8].max = want_ch;
-    p.intervals[SNDRV_PCM_HW_PARAM_RATE-8].min = p.intervals[SNDRV_PCM_HW_PARAM_RATE-8].max = 48000;
+    p.intervals[SNDRV_PCM_HW_PARAM_FRAME_BITS-8].min = p.intervals[SNDRV_PCM_HW_PARAM_FRAME_BITS-8].max = 16 * channels;
+    p.intervals[SNDRV_PCM_HW_PARAM_CHANNELS-8].min = p.intervals[SNDRV_PCM_HW_PARAM_CHANNELS-8].max = (unsigned)channels;
+    p.intervals[SNDRV_PCM_HW_PARAM_RATE-8].min = p.intervals[SNDRV_PCM_HW_PARAM_RATE-8].max = INPUT_RATE;
     for (int i = 0; i < 12; i++) p.intervals[i].integer = 1;
     p.intervals[SNDRV_PCM_HW_PARAM_TICK_TIME-8].integer = 0;
     p.rmask = (1u<<SNDRV_PCM_HW_PARAM_ACCESS)|(1u<<SNDRV_PCM_HW_PARAM_FORMAT)|(1u<<SNDRV_PCM_HW_PARAM_SUBFORMAT)
             |(1u<<SNDRV_PCM_HW_PARAM_SAMPLE_BITS)|(1u<<SNDRV_PCM_HW_PARAM_FRAME_BITS)
             |(1u<<SNDRV_PCM_HW_PARAM_CHANNELS)|(1u<<SNDRV_PCM_HW_PARAM_RATE);
 
-    if (ioctl(fd, SNDRV_PCM_IOCTL_HW_PARAMS, &p) != 0) return -1;
+    if (ioctl(fd, SNDRV_PCM_IOCTL_HW_PARAMS, &p)!= 0) return -1;
     unsigned buf = p.intervals[SNDRV_PCM_HW_PARAM_BUFFER_SIZE-8].max;
     if (buf < 16) buf = 16;
 
     struct snd_pcm_sw_params s = {0};
     s.tstamp_mode = 1; s.period_step = 1; s.start_threshold = 1;
     s.avail_min = 1; s.stop_threshold = buf; s.xfer_align = 1;
-    if (ioctl(fd, SNDRV_PCM_IOCTL_SW_PARAMS, &s) != 0) return -1;
-    if (ioctl(fd, SNDRV_PCM_IOCTL_PREPARE, 0) != 0) return -1;
+    if (ioctl(fd, SNDRV_PCM_IOCTL_SW_PARAMS, &s)!= 0) return -1;
+    if (ioctl(fd, SNDRV_PCM_IOCTL_PREPARE, 0)!= 0) return -1;
     ioctl(fd, SNDRV_PCM_IOCTL_START, 0);
     return 0;
 }
-static void mic_start(int fd) {
-    ioctl(fd, SNDRV_PCM_IOCTL_PREPARE, 0);
-    ioctl(fd, SNDRV_PCM_IOCTL_START, 0);
+
+static void mic_restart(int fd) {
+    if (ioctl(fd, SNDRV_PCM_IOCTL_PREPARE, 0) != 0) {
+        log_err("transcriber: mic prepare failed\n");
+    }
+    if (ioctl(fd, SNDRV_PCM_IOCTL_START, 0) != 0) {
+
+    }
 }
-static int mic_try(const char *path) {
-    int fd = open(path, O_RDWR|O_NONBLOCK|O_CLOEXEC);
+
+static int mic_try_open(const char *path, int *out_channels) {
+    int fd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) return -1;
     for (int ch = 2; ch >= 1; ch--) {
-        g_mic_cfg = ch;
-        if (alsa_setup(fd, ch) == 0) return fd;
+        if (alsa_hw_configure(fd, ch) == 0) { *out_channels = ch; return fd; }
         ioctl(fd, SNDRV_PCM_IOCTL_DROP, 0);
     }
     close(fd);
     return -1;
 }
-static int pcm_nums(const char *s, unsigned *card, unsigned *dev) {
-    char tail;
-    if (sscanf(s, "pcmC%uD%u%c", card, dev, &tail) == 3 && tail == 'c') return 0;
-    return -1;
-}
-static int mic_scan(void) {
+
+static int mic_scan_alsa(void) {
     DIR *d = opendir("/dev/snd");
     if (!d) return -1;
+
     char names[16][16];
     unsigned keys[16];
     int n = 0;
     struct dirent *ent;
-    while (n < 16 && (ent = readdir(d))) {
+    while (n < 16 && (ent = readdir(d))!= NULL) {
         if (strncmp(ent->d_name, "pcmC", 4)!= 0) continue;
         size_t l = strlen(ent->d_name);
-        if (l < 8 || l >= 16) continue;
-        if (ent->d_name[l-1]!= 'c') continue;
-        unsigned c, dv;
-        if (pcm_nums(ent->d_name, &c, &dv)!= 0) continue;
+        if (l < 8 || l >= 16 || ent->d_name[l-1]!= 'c') continue;
+        unsigned card, dev; char tail;
+        if (sscanf(ent->d_name, "pcmC%uD%u%c", &card, &dev, &tail)!= 3 || tail!= 'c') continue;
         strcpy(names[n], ent->d_name);
-        keys[n] = c * 256 + dv;
+        keys[n] = card * 256 + dev;
         n++;
     }
     closedir(d);
-    // selection sort by card/dev
-    for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++) if (keys[j] < keys[i]) {
+
+    for (int i = 0; i < n; i++) for (int j = i+1; j < n; j++) if (keys[j] < keys[i]) {
         unsigned tk = keys[i]; keys[i] = keys[j]; keys[j] = tk;
         char t[16]; strcpy(t, names[i]); strcpy(names[i], names[j]); strcpy(names[j], t);
     }
+
     for (int i = 0; i < n; i++) {
         char path[64];
-        snprintf(path, sizeof path, "/dev/snd/%s", names[i]);
-        int fd = mic_try(path);
-        if (fd >= 0) return fd;
+        snprintf(path, sizeof(path), "/dev/snd/%s", names[i]);
+        int ch = 0;
+        int fd = mic_try_open(path, &ch);
+        if (fd >= 0) { g_resampler.channels = ch; return fd; }
     }
     return -1;
 }
-static int mic_spawn(char *const argv[], pid_t *pid) {
-    int fds[2];
-    if (pipe(fds)!= 0) return -1;
-    pid_t p = fork();
-    if (p < 0) { close(fds[0]); close(fds[1]); return -1; }
-    if (p == 0) {
-        dup2(fds[1], 1);
-        close(fds[0]); close(fds[1]);
-        execvp(argv[0], argv);
-        _exit(127);
-    }
-    close(fds[1]);
-    int fl = fcntl(fds[0], F_GETFL, 0);
-    if (fl >= 0) fcntl(fds[0], F_SETFL, fl | O_NONBLOCK);
-    *pid = p;
-    return fds[0];
-}
-static int mic_fallback_one(char *const argv[]) {
-    pid_t pid = -1;
-    int fd = mic_spawn(argv, &pid);
-    if (fd < 0) return -1;
-    sleep_ms(300);
-    if (pid < 0 || kill(pid, 0) != 0) { close(fd); return -1; }
-    return fd;
-}
-static int mic_fallback(void) {
-    char *const a1[] = {"parec","--raw","--format=s16le","--rate=48000","--channels=1",0};
-    char *const a2[] = {"arecord","-q","-D","default","-f","S16_LE","-r","48000","-c","1","-t","raw","-",0};
-    char *const a3[] = {"pw-record","--format=s16","--rate=48000","--channels=1","-",0};
-    int fd = -1;
-    if (on_path("parec")) fd = mic_fallback_one(a1);
-    if (fd < 0 && on_path("arecord")) fd = mic_fallback_one(a2);
-    if (fd < 0 && on_path("pw-record")) fd = mic_fallback_one(a3);
-    if (fd >= 0) {
-        g_mic_cfg = 1;
-        eput("transcriber: mic fallback 48k mono (sound server)\n");
-    }
-    return fd;
-}
+
 static int mic_open(void) {
-    int fd = mic_scan();
-    if (fd >= 0) {
-        eput(g_mic_cfg == 2? "transcriber: mic 48k stereo -> 16k mono\n"
-                            : "transcriber: mic 48k mono -> 16k mono\n");
-        return fd;
-    }
-    fd = mic_fallback();
+    int fd = mic_scan_alsa();
     if (fd >= 0) return fd;
-    eput("transcriber: no usable mic (need audio group or busy device?)\n");
-    exit(2);
+    fatal("no usable mic (ALSA only build; need audio group or busy device?)");
+    return -1;
 }
 
-/* input */
-static int ev_autoscan(int *fds) {
+static int input_scan(int *fds, int cap) {
     int n = 0;
-    for (int i = 0; i < 32 && n < MAX_EVENTS; i++) {
+    for (int i = 0; i < 32 && n < cap; i++) {
         char path[64];
-        snprintf(path, sizeof path, "/dev/input/event%d", i);
-        int fd = open(path, O_RDONLY|O_NONBLOCK|O_CLOEXEC);
+        snprintf(path, sizeof(path), "/dev/input/event%d", i);
+        int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
         if (fd < 0) continue;
-        unsigned long bits[(KEY_MAX+7)/8/sizeof(long)] = {0};
-        if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof bits), bits) < 0) { close(fd); continue; }
-        if (!(bits[g_keycode/(8*sizeof(long))] & (1UL << (g_keycode%(8*sizeof(long)))))) { close(fd); continue; }
+        unsigned long bits[(KEY_MAX + 7) / 8 / sizeof(long)] = {0};
+        if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(bits)), bits) < 0) { close(fd); continue; }
+        unsigned long mask = 1UL << (KEY_CODE % (8 * sizeof(long)));
+        if (!(bits[KEY_CODE / (8 * sizeof(long))] & mask)) { close(fd); continue; }
         fds[n++] = fd;
     }
     return n;
 }
 
-/* wav */
-static void wav_header(unsigned char *h, uint32_t data_len) {
-    uint32_t riff = 36 + data_len, br = SAMPLE_RATE * CHANNELS * 2;
-    uint32_t fmt_len = 16, sr = SAMPLE_RATE;
-    uint16_t fmt = 1, ch = CHANNELS, bits = 16, ba = CHANNELS * 2;
-    memcpy(h+0, "RIFF", 4); memcpy(h+4, &riff, 4); memcpy(h+8, "WAVEfmt ", 8);
-    memcpy(h+16, &fmt_len, 4); memcpy(h+20, &fmt, 2); memcpy(h+22, &ch, 2);
-    memcpy(h+24, &sr, 4); memcpy(h+28, &br, 4); memcpy(h+32, &ba, 2);
-    memcpy(h+34, &bits, 2); memcpy(h+36, "data", 4); memcpy(h+40, &data_len, 4);
+static void tls_init(const char *host) {
+    br_x509_minimal_init(&g_tls.xc, &br_sha256_vtable, TAs, TAs_NUM);
+    br_x509_minimal_set_hash(&g_tls.xc, br_sha256_ID, &br_sha256_vtable);
+    br_x509_minimal_set_hash(&g_tls.xc, br_sha384_ID, &br_sha384_vtable);
+    br_x509_minimal_set_rsa(&g_tls.xc, br_rsa_i31_pkcs1_vrfy);
+    br_x509_minimal_set_ecdsa(&g_tls.xc, &br_ec_all_m31, br_ecdsa_i31_vrfy_asn1);
+    br_ssl_client_zero(&g_tls.sc);
+
+#ifdef BR_TLS13
+    br_ssl_engine_set_versions(&g_tls.sc.eng, BR_TLS12, BR_TLS13);
+#else
+    br_ssl_engine_set_versions(&g_tls.sc.eng, BR_TLS12, 0x0304);
+#endif
+    br_ssl_engine_set_suites(&g_tls.sc.eng, TLS_SUITES, sizeof(TLS_SUITES)/sizeof(TLS_SUITES[0]));
+    br_ssl_engine_set_hash(&g_tls.sc.eng, br_sha256_ID, &br_sha256_vtable);
+    br_ssl_engine_set_hash(&g_tls.sc.eng, br_sha384_ID, &br_sha384_vtable);
+    br_ssl_engine_set_prf10(&g_tls.sc.eng, &br_tls12_sha256_prf);
+    br_ssl_engine_set_prf_sha256(&g_tls.sc.eng, &br_tls12_sha256_prf);
+    br_ssl_engine_set_prf_sha384(&g_tls.sc.eng, &br_tls12_sha384_prf);
+    br_ssl_engine_set_default_aes_gcm(&g_tls.sc.eng);
+    br_ssl_engine_set_ec(&g_tls.sc.eng, &br_ec_all_m31);
+    br_ssl_engine_set_rsavrfy(&g_tls.sc.eng, br_rsa_i31_pkcs1_vrfy);
+    br_ssl_engine_set_ecdsa(&g_tls.sc.eng, br_ecdsa_i31_vrfy_asn1);
+    br_ssl_engine_set_x509(&g_tls.sc.eng, &g_tls.xc.vtable);
+    br_ssl_engine_set_buffer(&g_tls.sc.eng, g_tls.iobuf, sizeof(g_tls.iobuf), 0);
+    br_ssl_client_reset(&g_tls.sc, host, 0);
 }
 
-/* tls */
-static void tls_profile_init(const char *host) {
-    br_x509_minimal_init(&g_sess.xc, &br_sha256_vtable, TAs, TAs_NUM);
-    br_x509_minimal_set_hash(&g_sess.xc, br_sha256_ID, &br_sha256_vtable);
-    br_x509_minimal_set_hash(&g_sess.xc, br_sha384_ID, &br_sha384_vtable);
-    br_x509_minimal_set_rsa(&g_sess.xc, br_rsa_i31_pkcs1_vrfy);
-    br_x509_minimal_set_ecdsa(&g_sess.xc, &br_ec_all_m31, br_ecdsa_i31_vrfy_asn1);
-    br_ssl_client_zero(&g_sess.sc);
-    br_ssl_engine_set_versions(&g_sess.sc.eng, BR_TLS12, BR_TLS12);
-    br_ssl_engine_set_suites(&g_sess.sc.eng, tls_suites, sizeof tls_suites/sizeof tls_suites[0]);
-    br_ssl_engine_set_hash(&g_sess.sc.eng, br_sha256_ID, &br_sha256_vtable);
-    br_ssl_engine_set_hash(&g_sess.sc.eng, br_sha384_ID, &br_sha384_vtable);
-    br_ssl_engine_set_prf10(&g_sess.sc.eng, &br_tls12_sha256_prf);
-    br_ssl_engine_set_prf_sha256(&g_sess.sc.eng, &br_tls12_sha256_prf);
-    br_ssl_engine_set_prf_sha384(&g_sess.sc.eng, &br_tls12_sha384_prf);
-    br_ssl_engine_set_default_aes_gcm(&g_sess.sc.eng);
-    br_ssl_engine_set_ec(&g_sess.sc.eng, &br_ec_all_m31);
-    br_ssl_engine_set_rsavrfy(&g_sess.sc.eng, br_rsa_i31_pkcs1_vrfy);
-    br_ssl_engine_set_ecdsa(&g_sess.sc.eng, br_ecdsa_i31_vrfy_asn1);
-    br_ssl_engine_set_x509(&g_sess.sc.eng, &g_sess.xc.vtable);
-    br_ssl_engine_set_buffer(&g_sess.sc.eng, g_sess.tlsbuf, sizeof g_sess.tlsbuf, 1);
-    if (g_tls_sess_valid) br_ssl_engine_set_session_parameters(&g_sess.sc.eng, &g_tls_sess);
-    br_ssl_client_reset(&g_sess.sc, host, g_tls_sess_valid);
-}
-static int dns_resolve(const char *host, struct sockaddr_storage *dst, socklen_t *len) {
-    struct addrinfo h = {.ai_family=AF_UNSPEC,.ai_socktype=SOCK_STREAM};
-    struct addrinfo *r = 0;
-    if (getaddrinfo(host, "443", &h, &r) != 0 || !r) return -1;
-    memcpy(dst, r->ai_addr, r->ai_addrlen);
-    *len = r->ai_addrlen;
-    freeaddrinfo(r);
+static int dns_resolve_host(const char *host) {
+    struct addrinfo hint = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM};
+    struct addrinfo *res = NULL, *p;
+    int rc = getaddrinfo(host, "443", &hint, &res);
+    if (rc != 0 || !res) {
+        g_remote_count = 0;
+        return -1;
+    }
+    int n = 0;
+    for (p = res; p && n < MAX_REMOTES; p = p->ai_next) {
+        if (p->ai_addrlen > sizeof(g_remotes[0])) continue;
+        memcpy(&g_remotes[n], p->ai_addr, p->ai_addrlen);
+        g_remote_lens[n] = p->ai_addrlen;
+        n++;
+    }
+    freeaddrinfo(res);
+    if (n == 0) {
+        g_remote_count = 0;
+        return -1;
+    }
+    g_remote_count = n;
     return 0;
 }
-static int json_get_text(const char *js, size_t n, char *out, size_t cap) {
-    // memchr fast-skip: only bytes equal to '"' can start "\"text\"",
-    // so skipped bytes had no effect in the byte-wise scan. Parse of
-    // each candidate below is verbatim the old logic.
+
+static int dns_resolve_once(const char *host) {
+    return dns_resolve_host(host);
+}
+
+static int json_extract_text(const char *js, size_t n, char *out, size_t cap) {
     size_t i = 0;
     while (i + 6 < n) {
         const void *f = memchr(js + i, '"', (n - 6) - i);
         if (!f) break;
         i = (const char *)f - js;
-        if (memcmp(js+i, "\"text\"", 6)!= 0) { i++; continue; }
+        if (memcmp(js + i, "\"text\"", 6)!= 0) { i++; continue; }
         size_t j = i + 6;
         while (j < n && (js[j]==' '||js[j]=='\t'||js[j]=='\r'||js[j]=='\n')) j++;
-        if (j >= n || js[j]!= ':') { i++; continue; } j++;
+        if (j >= n || js[j]!= ':') { i++; continue; }
+        j++;
         while (j < n && (js[j]==' '||js[j]=='\t')) j++;
-        if (j >= n || js[j]!= '"') { i++; continue; } j++;
+        if (j >= n || js[j]!= '"') { i++; continue; }
+        j++;
         size_t o = 0;
         while (j < n && o + 4 < cap) {
             char c = js[j++];
-            if (c == '"') { out[o]=0; return o; }
-            if (c!= '\\') { out[o++]=c; continue; }
+            if (c == '"') { out[o]=0; return (int)o; }
+            if (c!= '\\') { out[o++] = c; continue; }
             if (j >= n) break;
             char e = js[j++];
             switch (e) {
-            case '"': out[o++]='"'; break;
-            case '\\': out[o++]='\\'; break;
-            case '/': out[o++]='/'; break;
-            case 'n': out[o++]='\n'; break;
-            case 'r': out[o++]='\r'; break;
-            case 't': out[o++]='\t'; break;
-            case 'u': {
-                if (j+4>n) break;
-                unsigned v=0;
-                for (int k=0;k<4;k++){ char h=js[j++]; v<<=4; if(h>='0'&&h<='9') v|=h-'0'; else if(h>='a'&&h<='f') v|=h-'a'+10; else if(h>='A'&&h<='F') v|=h-'A'+10; }
-                if (v<0x80) out[o++]=v;
-                else if (v<0x800){ out[o++]=0xC0|(v>>6); out[o++]=0x80|(v&0x3F); }
-                else { out[o++]=0xE0|(v>>12); out[o++]=0x80|((v>>6)&0x3F); out[o++]=0x80|(v&0x3F); }
-                break;
-            }
-            default: out[o++]=e; break;
+                case '"': out[o++]='"'; break;
+                case '\\': out[o++]='\\'; break;
+                case '/': out[o++]='/'; break;
+                case 'n': out[o++]='\n'; break;
+                case 'r': out[o++]='\r'; break;
+                case 't': out[o++]='\t'; break;
+                case 'u': {
+                    if (j+4>n) break;
+                    unsigned v=0;
+                    for (int k=0;k<4;k++){ char h=js[j++]; v<<=4; if(h>='0'&&h<='9') v|=h-'0'; else if(h>='a'&&h<='f') v|=h-'a'+10; else if(h>='A'&&h<='F') v|=h-'A'+10; }
+                    if (v<0x80) out[o++]=(char)v;
+                    else if (v<0x800){ out[o++]=0xC0|(v>>6); out[o++]=0x80|(v&0x3F); }
+                    else { out[o++]=0xE0|(v>>12); out[o++]=0x80|((v>>6)&0x3F); out[o++]=0x80|(v&0x3F); }
+                    break;
+                }
+                default: out[o++]=e; break;
             }
         }
         out[o]=0;
-        return o;
+        return (int)o;
     }
     return -1;
 }
 
-/* tls io */
-static int tls_poll(int fd, short ev, int ms) {
+static int fd_poll(int fd, short ev, int timeout_ms) {
     struct pollfd p = {fd, ev, 0};
-    int r = poll(&p, 1, ms);
+    int r = poll(&p, 1, timeout_ms);
     if (r <= 0) return -1;
     if (p.revents & (POLLERR|POLLHUP|POLLNVAL)) return -1;
     return 0;
 }
-static int tls_pump(br_ssl_engine_context *eng, int fd, short ev, long long until) {
-    size_t n=0; unsigned char *b;
-    long long left = until - now_ms();
+
+static int tls_pump_once(br_ssl_engine_context *eng, int fd, short ev, int64_t deadline) {
+    size_t n = 0;
+    unsigned char *buf;
+    int64_t left = deadline - now_ms();
     if (left <= 0) return -1;
     if (ev == POLLOUT) {
-        b = br_ssl_engine_sendrec_buf(eng, &n);
-        if (!n) return -1;
-        if (tls_poll(fd, POLLOUT, left)!= 0) return -1;
-        ssize_t w = send(fd, b, n, MSG_NOSIGNAL);
+        buf = br_ssl_engine_sendrec_buf(eng, &n);
+        if (n == 0) return -1;
+        if (fd_poll(fd, POLLOUT, (int)left)!= 0) return -1;
+        ssize_t w = send(fd, buf, n, MSG_NOSIGNAL);
         if (w <= 0) return -1;
-        br_ssl_engine_sendrec_ack(eng, w);
+        br_ssl_engine_sendrec_ack(eng, (size_t)w);
     } else {
-        b = br_ssl_engine_recvrec_buf(eng, &n);
-        if (!n) return -1;
-        if (tls_poll(fd, POLLIN, left)!= 0) return -1;
-        ssize_t r = recv(fd, b, n, 0);
+        buf = br_ssl_engine_recvrec_buf(eng, &n);
+        if (n == 0) return -1;
+        if (fd_poll(fd, POLLIN, (int)left)!= 0) return -1;
+        ssize_t r = recv(fd, buf, n, 0);
         if (r <= 0) return -1;
-        br_ssl_engine_recvrec_ack(eng, r);
+        br_ssl_engine_recvrec_ack(eng, (size_t)r);
     }
     return 0;
 }
-static int tls_handshake(br_ssl_engine_context *eng, int fd, long long until) {
+
+static int tls_do_handshake(br_ssl_engine_context *eng, int fd, int64_t deadline) {
     for (;;) {
         unsigned st = br_ssl_engine_current_state(eng);
         if (st & BR_SSL_CLOSED) return -1;
-        if (st & (BR_SSL_SENDAPP|BR_SSL_RECVAPP)) return 0;
-        if (tls_pump(eng, fd, (st & BR_SSL_SENDREC)? POLLOUT : POLLIN, until)!= 0) return -1;
+        if (st & (BR_SSL_SENDAPP | BR_SSL_RECVAPP)) return 0;
+        short ev = (st & BR_SSL_SENDREC)? POLLOUT : POLLIN;
+        if (tls_pump_once(eng, fd, ev, deadline)!= 0) return -1;
     }
 }
-static int tls_send_all(br_ssl_engine_context *eng, int fd, const unsigned char *p, size_t n, long long until) {
-    size_t off=0;
-    while (off < n) {
+
+static int tls_send_all(br_ssl_engine_context *eng, int fd, const uint8_t *data, size_t len, int64_t deadline) {
+    size_t off = 0;
+    while (off < len) {
         unsigned st = br_ssl_engine_current_state(eng);
         if (st & BR_SSL_CLOSED) return -1;
-        if (st & BR_SSL_SENDREC) { if (tls_pump(eng, fd, POLLOUT, until)!= 0) return -1; continue; }
+        if (st & BR_SSL_SENDREC) {
+            if (tls_pump_once(eng, fd, POLLOUT, deadline)!= 0) return -1;
+            continue;
+        }
         if (st & BR_SSL_SENDAPP) {
-            size_t m=0; unsigned char *b = br_ssl_engine_sendapp_buf(eng, &m);
-            if (!m) return -1;
-            size_t w = n-off < m? n-off : m;
-            memcpy(b, p+off, w);
+            size_t avail = 0;
+            unsigned char *buf = br_ssl_engine_sendapp_buf(eng, &avail);
+            if (avail == 0) return -1;
+            size_t w = len - off < avail? len - off : avail;
+            memcpy(buf, data + off, w);
             br_ssl_engine_sendapp_ack(eng, w);
             br_ssl_engine_flush(eng, 0);
-            off+=w; continue;
+            off += w;
+            continue;
         }
-        if (tls_pump(eng, fd, POLLIN, until)!= 0) return -1;
+        if (tls_pump_once(eng, fd, POLLIN, deadline)!= 0) return -1;
     }
     return 0;
 }
-static ssize_t tls_read_all(br_ssl_engine_context *eng, int fd, char *out, size_t cap, long long until) {
-    size_t off=0;
-    while (off+1 < cap) {
+
+static ssize_t tls_recv_all(br_ssl_engine_context *eng, int fd, char *out, size_t cap, int64_t deadline) {
+    size_t off = 0;
+    while (off + 1 < cap) {
         unsigned st = br_ssl_engine_current_state(eng);
         if (st & BR_SSL_RECVAPP) {
-            size_t m=0; unsigned char *b = br_ssl_engine_recvapp_buf(eng, &m);
-            if (!m) break;
-            size_t w = off+m > cap-1? cap-1-off : m;
-            memcpy(out+off, b, w); off+=w;
-            br_ssl_engine_recvapp_ack(eng, m);
+            size_t avail = 0;
+            unsigned char *buf = br_ssl_engine_recvapp_buf(eng, &avail);
+            if (avail == 0) break;
+            size_t w = off + avail > cap - 1? cap - 1 - off : avail;
+            memcpy(out + off, buf, w);
+            off += w;
+            br_ssl_engine_recvapp_ack(eng, avail);
             continue;
         }
         if (st & BR_SSL_CLOSED) break;
-        if (st & BR_SSL_SENDREC) { if (tls_pump(eng, fd, POLLOUT, until)!= 0) break; continue; }
-        if (tls_pump(eng, fd, POLLIN, until)!= 0) break;
+        short ev = (st & BR_SSL_SENDREC)? POLLOUT : POLLIN;
+        if (tls_pump_once(eng, fd, ev, deadline)!= 0) break;
     }
-    out[off]=0;
-    return off;
+    out[off] = 0;
+    return (ssize_t)off;
 }
 
-/* http */
-static int build_parts(void) {
-    int n = snprintf(part1_head, sizeof part1_head,
+static int build_multipart_header(void) {
+    int n = snprintf(g_multipart_head, sizeof(g_multipart_head),
         "--" BOUNDARY "\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n%s\r\n"
         "--" BOUNDARY "\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\n%s\r\n"
         "--" BOUNDARY "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n"
-        "Content-Type: audio/wav\r\n\r\n", g_model, g_lang);
-    if (n <= 0 || (size_t)n >= sizeof part1_head) return -1;
-    part1_len = n;
+        "Content-Type: audio/wav\r\n\r\n", g_cfg.model, g_cfg.lang);
+    if (n <= 0 || (size_t)n >= sizeof(g_multipart_head)) return -1;
+    g_multipart_head_len = (size_t)n;
     return 0;
 }
-static void paste_at_cursor(const char *text);
-static int transmit(int mfd, uint32_t wav_data_len) {
-    uint32_t wav_total = WAV_HDR_LEN + wav_data_len;
-    size_t body_len = part1_len + wav_total + sizeof part_tail - 1;
 
-    char req[2048];
-    int rl = snprintf(req, sizeof req,
-        "POST %s HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer %s\r\n"
-        "Content-Type: multipart/form-data; boundary=" BOUNDARY "\r\n"
-        "Content-Length: %zu\r\nConnection: close\r\n\r\n",
-        g_epath, g_host, g_apikey, body_len);
-    if (rl <= 0 || (size_t)rl >= sizeof req) return -1;
-
-    int fd = socket(g_dst.ss_family, SOCK_STREAM|SOCK_CLOEXEC, 0);
-    if (fd < 0) goto fail_req;
-    int one=1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-    int fl = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, fl|O_NONBLOCK);
-    if (connect(fd, (struct sockaddr*)&g_dst, g_dstlen)!= 0 && errno!= EINPROGRESS) goto fail;
-    if (tls_poll(fd, POLLOUT, 10000)!= 0) goto fail;
-    int err=0; socklen_t el=sizeof err;
-    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el)!= 0 || err) goto fail;
-    fcntl(fd, F_SETFL, fl);
-
-    tls_profile_init(g_host);
-    if (br_ssl_engine_current_state(&g_sess.sc.eng) & BR_SSL_CLOSED) goto fail;
-    long long until = now_ms() + 45000;
-    if (tls_handshake(&g_sess.sc.eng, fd, now_ms()+12000)!= 0) { g_tls_sess_valid=0; goto fail; }
-    br_ssl_engine_get_session_parameters(&g_sess.sc.eng, &g_tls_sess);
-    g_tls_sess_valid = 1;
-
-    if (tls_send_all(&g_sess.sc.eng, fd, (unsigned char*)req, rl, until)!= 0) goto fail;
-    if (tls_send_all(&g_sess.sc.eng, fd, (unsigned char*)part1_head, part1_len, until)!= 0) goto fail;
-    if (lseek(mfd, 0, SEEK_SET) < 0) goto fail;
-
-    unsigned char chunk[16384];
-    uint32_t left = wav_total;
-    while (left) {
-        size_t want = left > sizeof chunk? sizeof chunk : left;
-        ssize_t r = read(mfd, chunk, want);
-        if (r <= 0) goto fail;
-        if (tls_send_all(&g_sess.sc.eng, fd, chunk, r, until)!= 0) goto fail;
-        left -= r;
-    }
-    if (tls_send_all(&g_sess.sc.eng, fd, (unsigned char*)part_tail, sizeof part_tail-1, until)!= 0) goto fail;
-    explicit_bzero(req, sizeof req);
-
-    ssize_t rlen = tls_read_all(&g_sess.sc.eng, fd, g_sess.resp, sizeof g_sess.resp, until);
-    close(fd);
-    if (rlen <= 0) return -1;
-    int code = 0;
-    if (rlen > 12 && !memcmp(g_sess.resp, "HTTP/", 5) && g_sess.resp[8] == ' ')
-        code = (g_sess.resp[9]-'0')*100 + (g_sess.resp[10]-'0')*10 + (g_sess.resp[11]-'0');
-    if (code!= 200) return code;
-    const char *body = strstr(g_sess.resp, "\r\n\r\n");
-    if (!body) return -1;
-    body += 4;
-    size_t blen = rlen - (body - g_sess.resp);
-    if (json_get_text(body, blen, g_sess.tout, sizeof g_sess.tout) < 0) return -1;
-    paste_at_cursor(g_sess.tout);
-    return 0;
-
-fail:
-    close(fd);
-fail_req:
-    explicit_bzero(req, sizeof req);
+static int hex_val(char c) {
+    if (c>='0'&&c<='9') return c-'0';
+    if (c>='a'&&c<='f') return c-'a'+10;
+    if (c>='A'&&c<='F') return c-'A'+10;
     return -1;
 }
 
-/* paste (X11 only, double-fork daemon) */
-static void paste_at_cursor(const char *text) {
-    const char *st = getenv("XDG_SESSION_TYPE");
-    int wayland = (st && !strcmp(st, "wayland")) || (getenv("WAYLAND_DISPLAY") && !getenv("DISPLAY"));
-    if (wayland || !on_path("xclip") || !on_path("xdotool")) {
-        eput("transcriber: paste skipped (X11-only helpers)\n");
+static ssize_t http_decode_chunked(char *body, size_t blen) {
+    size_t src = 0, dst = 0;
+    while (src < blen) {
+
+        size_t line_start = src;
+        while (src < blen && body[src] != '\n') src++;
+        if (src >= blen) return -1;
+        size_t line_end = src;
+        if (line_end > line_start && body[line_end-1] == '\r') line_end--;
+
+        size_t semi = line_start;
+        while (semi < line_end && body[semi] != ';') semi++;
+        size_t hex_end = (semi < line_end) ? semi : line_end;
+
+        size_t chunk_size = 0;
+        bool got = false;
+        for (size_t i=line_start;i<hex_end;i++) {
+            int v = hex_val(body[i]);
+            if (v < 0) {
+                if (body[i]==' '||body[i]=='\t') continue;
+                return -1;
+            }
+            got = true;
+            if (chunk_size > (SIZE_MAX>>4)) return -1;
+            chunk_size = (chunk_size<<4) | (size_t)v;
+        }
+        if (!got) return -1;
+        src++;
+        if (chunk_size == 0) {
+
+            break;
+        }
+        if (src + chunk_size > blen) return -1;
+        if (dst + chunk_size > blen) return -1;
+        memmove(body+dst, body+src, chunk_size);
+        dst += chunk_size;
+        src += chunk_size;
+
+        if (src < blen && body[src] == '\r') src++;
+        if (src < blen && body[src] == '\n') src++;
+    }
+    return (ssize_t)dst;
+}
+
+static int http_parse_status(const char *resp, size_t rlen) {
+    if (rlen < 12) return -1;
+    if (memcmp(resp, "HTTP/", 5) != 0) return -1;
+    if (resp[8] != ' ') return -1;
+    if (!isdigit((unsigned char)resp[9])||!isdigit((unsigned char)resp[10])||!isdigit((unsigned char)resp[11])) return -1;
+    return (resp[9]-'0')*100 + (resp[10]-'0')*10 + (resp[11]-'0');
+}
+
+static bool header_contains(const char *hdrs, size_t hlen, const char *needle) {
+
+    size_t nlen = strlen(needle);
+    if (nlen == 0 || hlen < nlen) return false;
+    for (size_t i=0;i+ nlen <= hlen;i++) {
+        size_t j=0;
+        for (;j<nlen;j++) {
+            char a = hdrs[i+j];
+            char b = needle[j];
+            if (tolower((unsigned char)a) != tolower((unsigned char)b)) break;
+        }
+        if (j==nlen) return true;
+    }
+    return false;
+}
+
+static struct { bool xclip,xdotool; } g_tools;
+static void tools_init(void) {
+    g_tools.xclip=executable_in_path("xclip"); g_tools.xdotool=executable_in_path("xdotool");
+}
+static void paste_text_at_cursor(const char *text) {
+    if (!g_tools.xclip || !g_tools.xdotool) {
+        log_err("transcriber: paste skipped (need xclip+xdotool)\n");
         return;
     }
+    size_t tlen=strlen(text);
     pid_t p = fork();
-    if (p != 0) { if (p > 0) wait_quiet(p); return; }
-    if (fork() != 0) _exit(0);
-
-    int nullfd = open("/dev/null", O_WRONLY|O_CLOEXEC);
-    if (nullfd >= 0) { dup2(nullfd, 1); if (nullfd != 1) close(nullfd); }
-
-    int clip_pipe[2];
-    if (pipe(clip_pipe) != 0) _exit(0);
-    size_t tlen = strlen(text);
-    pid_t clip_pid = fork();
-    if (clip_pid == 0) {
-        dup2(clip_pipe[0], 0); close(clip_pipe[0]); close(clip_pipe[1]);
-        execlp("xclip","xclip","-selection","clipboard","-i",(char*)0);
-        _exit(0);
-    }
-    close(clip_pipe[0]); write_all(clip_pipe[1], text, tlen); close(clip_pipe[1]);
-    if (clip_pid > 0) wait_quiet(clip_pid);
-
-    // wait for clipboard to contain our text
-    long long deadline = now_ms() + 2000;
-    size_t want = tlen;
-    if (want > 255) want = 255;
-    int ok = 0;
-    char probe[256];
-    while (!ok && now_ms() < deadline) {
-        int out_pipe[2]; if (pipe(out_pipe) != 0) break;
-        pid_t qpid = fork();
-        if (qpid == 0) {
-            dup2(out_pipe[1],1); close(out_pipe[0]); close(out_pipe[1]);
-            execlp("xclip","xclip","-selection","clipboard","-o",(char*)0);
-            _exit(0);
-        }
-        close(out_pipe[1]);
-        ssize_t tot=0, r;
-        while (tot < (ssize_t)want && (r=read(out_pipe[0], probe+tot, want-tot))>0) tot+=r;
-        wait_quiet(qpid);
-        close(out_pipe[0]);
-        if (tot == (ssize_t)want && memcmp(probe, text, want)==0) ok=1;
-        else sleep_ms(10);
-    }
-    if (!ok) _exit(0);
-
-    pid_t paste_pid = fork();
-    if (paste_pid == 0) { execlp("xdotool","xdotool","key","ctrl+shift+v",(char*)0); _exit(0); }
-    if (paste_pid > 0) wait_quiet(paste_pid);
+    if (p != 0) { if (p > 0) { int st_; while (waitpid(p, &st_, 0) < 0 && errno == EINTR) {} } return; }
+    if (fork()!=0) _exit(0);
+    int clip[2];
+    if (pipe(clip)!=0) _exit(0);
+    pid_t cp=fork();
+    if(cp==0){ dup2(clip[0],STDIN_FILENO); close(clip[0]); close(clip[1]); execlp("xclip","xclip","-selection","clipboard","-i",(char*)0); _exit(0); }
+    close(clip[0]);
+    write_all(clip[1],text,tlen);
+    close(clip[1]);
+    if(cp>0){ int st_; while(waitpid(cp,&st_,0)<0&&errno==EINTR){} }
+    struct timespec ts={0,300*1000000L}; nanosleep(&ts,NULL);
+    pid_t pp=fork();
+    if(pp==0){ execlp("xdotool","xdotool","key","ctrl+v",(char*)0); _exit(0); }
+    if(pp>0){ int st_; while(waitpid(pp,&st_,0)<0&&errno==EINTR){} }
     _exit(0);
 }
 
-/* recording */
-static int do_press(int *evfds, int nev, int pcm, long long t0, uint32_t *out_len) {
+static int http_transmit_once(int memfd, uint32_t wav_data_len) {
+    if (g_remote_count <= 0) return -1;
+    int remote_idx = 0;
+    uint32_t wav_total = WAV_HDR_SIZE + wav_data_len;
+    size_t body_len = g_multipart_head_len + wav_total + sizeof(MULTIPART_TAIL) - 1;
+
+    char req[1024];
+    int rl = snprintf(req, sizeof(req),
+        "POST %s HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer %s\r\n"
+        "Content-Type: multipart/form-data; boundary=" BOUNDARY "\r\n"
+        "Content-Length: %zu\r\nConnection: close\r\n\r\n",
+        g_cfg.epath, g_cfg.host, g_cfg.api_key, body_len);
+    if (rl <= 0 || (size_t)rl >= sizeof(req)) { explicit_bzero(req,sizeof(req)); return -1; }
+
+    int fd = socket(g_remotes[remote_idx].ss_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) { explicit_bzero(req,sizeof(req)); return -1; }
+    int one=1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    int fl = fcntl(fd, F_GETFL,0);
+    if (fl>=0) fcntl(fd,F_SETFL, fl|O_NONBLOCK);
+
+    if (connect(fd, (struct sockaddr*)&g_remotes[remote_idx], g_remote_lens[remote_idx])!=0 && errno!=EINPROGRESS) {
+        close(fd); explicit_bzero(req,sizeof(req)); return -1;
+    }
+    if (fd_poll(fd, POLLOUT, 10000)!=0) { close(fd); explicit_bzero(req,sizeof(req)); return -1; }
+    int err=0; socklen_t el=sizeof(err);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el)!=0 || err) {
+        close(fd); explicit_bzero(req,sizeof(req)); return -1;
+    }
+    if (fl>=0) fcntl(fd,F_SETFL, fl);
+
+    tls_init(g_cfg.host);
+    if (br_ssl_engine_current_state(&g_tls.sc.eng) & BR_SSL_CLOSED) { close(fd); explicit_bzero(req,sizeof(req)); return -1; }
+
+    int64_t hs_dead = now_ms()+12000;
+    if (tls_do_handshake(&g_tls.sc.eng, fd, hs_dead)!=0) {
+        close(fd); explicit_bzero(req,sizeof(req)); return -1;
+    }
+
+    int64_t deadline = now_ms()+45000;
+    if (tls_send_all(&g_tls.sc.eng, fd, (uint8_t*)req, (size_t)rl, deadline)!=0) goto io_fail;
+    if (tls_send_all(&g_tls.sc.eng, fd, (uint8_t*)g_multipart_head, g_multipart_head_len, deadline)!=0) goto io_fail;
+    if (lseek(memfd,0,SEEK_SET)<0) goto io_fail;
+
+    uint8_t chunk[2048];
+    uint32_t left=wav_total;
+    while(left>0){
+        size_t want = left>sizeof(chunk)?sizeof(chunk):left;
+        ssize_t r=read(memfd,chunk,want);
+        if(r<=0) goto io_fail;
+        if(tls_send_all(&g_tls.sc.eng, fd, chunk, (size_t)r, deadline)!=0) goto io_fail;
+        left-=(uint32_t)r;
+    }
+    if(tls_send_all(&g_tls.sc.eng, fd, (uint8_t*)MULTIPART_TAIL, sizeof(MULTIPART_TAIL)-1, deadline)!=0) goto io_fail;
+
+    explicit_bzero(req,sizeof(req));
+    ssize_t rlen = tls_recv_all(&g_tls.sc.eng, fd, g_tls.resp, sizeof(g_tls.resp), deadline);
+    close(fd);
+    if (rlen<=0) return -1;
+    if (rlen >= (ssize_t)sizeof(g_tls.resp)-1) log_err("transcriber: HTTP response truncated at 8K\n");
+
+    int code = http_parse_status(g_tls.resp, (size_t)rlen);
+    if (code<0) return -1;
+
+    const char *hdr_end = strstr(g_tls.resp, "\r\n\r\n");
+    if (!hdr_end) return -1;
+    size_t header_len = (size_t)(hdr_end - g_tls.resp) + 4;
+    const char *body = hdr_end+4;
+    size_t blen = (size_t)rlen - header_len;
+
+    bool is_chunked = header_contains(g_tls.resp, header_len, "transfer-encoding: chunked");
+    if (is_chunked) {
+        ssize_t decoded = http_decode_chunked((char*)body, blen);
+        if (decoded < 0) return -1;
+        blen = (size_t)decoded;
+    }
+
+    if (code!=200) return code;
+
+    int tlen = json_extract_text(body, blen, g_tls.transcript, sizeof(g_tls.transcript));
+    if (tlen<0) return -1;
+
+    size_t skip = strspn(g_tls.transcript, " \t\r\n");
+    if (skip) memmove(g_tls.transcript, g_tls.transcript+skip, (size_t)tlen-skip+1);
+    if (!g_tls.transcript[0]) return 0;
+    paste_text_at_cursor(g_tls.transcript);
+    return 0;
+
+io_fail:
+    close(fd);
+    explicit_bzero(req,sizeof(req));
+    return -1;
+}
+
+static int record_while_held(int *evfds, int nev, int pcm_fd, int64_t t0, uint32_t *out_data_len) {
     int mfd = memfd_create("trb", MFD_CLOEXEC);
-    if (mfd < 0) return -1;
-    unsigned char hdr[WAV_HDR_LEN];
-    wav_header(hdr, 0);
-    if (write_all(mfd, hdr, sizeof hdr) < 0) { close(mfd); return -1; }
+    if (mfd < 0) {
+        log_err("transcriber: memfd_create failed\n");
+        return -1;
+    }
+    uint8_t hdr[WAV_HDR_SIZE];
+    wav_fill_header(hdr,0);
+    if (write_all(mfd,hdr,sizeof(hdr))<0){ log_err("transcriber: wav header write failed\n"); close(mfd); return -1; }
 
-    uint32_t total = 0;
-    ioctl(pcm, SNDRV_PCM_IOCTL_DROP, 0);
-    mic_start(pcm);
-    conv_acc = 0; conv_n = 0;
+    uint32_t total=0;
+    ioctl(pcm_fd,SNDRV_PCM_IOCTL_DROP,0);
+    mic_restart(pcm_fd);
+    g_resampler.acc=0; g_resampler.pending=0;
 
-    struct pollfd pf[MAX_EVENTS];
-    poll_init(pf, evfds, nev);
+    struct pollfd pf[MAX_INPUT_DEVS];
+    for(int i=0;i<nev;i++){ pf[i].fd=evfds[i]; pf[i].events=POLLIN; }
 
-    for (;;) {
-        int r = poll(pf, nev, 8);
-        if (r < 0 && errno != EINTR) break;
+    int16_t pcm_tmp[PCM_FRAMES];
 
-        for (int i = 0; i < nev; i++) {
-            if (pf[i].revents & (POLLERR|POLLHUP|POLLNVAL)) goto released;
-            if (!(pf[i].revents & POLLIN)) continue;
+    int iter = 0;
+    for(;;){
+        int r=poll(pf,nev,20);
+        if(r<0 && errno!=EINTR) { log_err("transcriber: poll in record failed\n"); break; }
+
+        for(int i=0;i<nev;i++){
+            if(pf[i].revents & (POLLERR|POLLHUP|POLLNVAL)) { log_err("transcriber: input device error during record\n"); goto released; }
+            if(!(pf[i].revents & POLLIN)) continue;
             struct input_event ev;
-            while (read(evfds[i], &ev, sizeof ev) == sizeof ev) {
-                if (ev.type != EV_KEY || ev.code != g_keycode) continue;
-                if (ev.value == 2) continue;
-                if (ev.value == 0) goto released;
+            while(read(evfds[i],&ev,sizeof(ev))==sizeof(ev)){
+                if(ev.type!=EV_KEY || ev.code!=KEY_CODE) continue;
+                if(ev.value==2) continue;
+                if(ev.value==0) goto released;
             }
         }
-        // drain pcm
-        for (;;) {
-            ssize_t n = conv_read(pcm, g_sess.pcmbuf, PCM_SAMPLES);
-            if (n < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                if (errno == EPIPE) { mic_start(pcm); break; }
-                if (errno == EINTR) continue;
+
+        for(;;){
+            ssize_t n=resample_read(pcm_fd,&g_resampler,pcm_tmp,PCM_FRAMES);
+            if(n<0){
+                if(errno==EAGAIN||errno==EWOULDBLOCK) break;
+                if(errno==EPIPE){ log_err("transcriber: ALSA overrun, restarting mic\n"); mic_restart(pcm_fd); break; }
+                if(errno==EINTR) continue;
+                log_err("transcriber: mic read failed\n");
                 break;
             }
-            if (n == 0) break;
-            if (total + n > MAX_WAV_DATA) goto released;
-            if (write_all(mfd, g_sess.pcmbuf, n) < 0) { close(mfd); return -1; }
-            total += n;
+            if(n==0) break;
+            if(total+(uint32_t)n > MAX_WAV_DATA){
+                log_err("transcriber: max duration reached, stopping\n");
+                goto released;
+            }
+            if(write_all(mfd,pcm_tmp,(size_t)n)<0){ log_err("transcriber: memfd write failed\n"); close(mfd); return -1; }
+            total+=(uint32_t)n;
         }
-        if (now_ms() - t0 > PRESS_MAX_MS) { close(mfd); return -1; }
+
+        if((++iter % 5)==0 && now_ms()-t0 > PRESS_MAX_MS){
+            log_err("transcriber: press exceeded max 60s, discarding\n");
+            close(mfd); return -1;
+        }
     }
+
 released:
-    if (now_ms() - t0 < PRESS_MIN_MS) { close(mfd); return -1; }
-    wav_header(hdr, total);
-    if (lseek(mfd, 0, SEEK_SET) < 0) { close(mfd); return -1; }
-    if (write_all(mfd, hdr, sizeof hdr) < 0) { close(mfd); return -1; }
-    *out_len = total;
+    {
+        int64_t dur = now_ms()-t0;
+        if(dur < PRESS_MIN_MS){
+            close(mfd); return -1;
+        }
+        if(total==0){
+            log_err("transcriber: no audio captured, discarding\n");
+            close(mfd); return -1;
+        }
+    }
+    wav_fill_header(hdr,total);
+    if(lseek(mfd,0,SEEK_SET)<0){ log_err("transcriber: lseek failed\n"); close(mfd); return -1; }
+    if(write_all(mfd,hdr,sizeof(hdr))<0){ log_err("transcriber: wav header rewrite failed\n"); close(mfd); return -1; }
+    *out_data_len=total;
     return mfd;
 }
-static void session_drop(void) {
-    if (madvise(&g_sess, sizeof g_sess, MADV_DONTNEED)!= 0) explicit_bzero(&g_sess, sizeof g_sess);
+
+static void tls_state_clear(void) {
+    size_t sz = sizeof(g_tls);
+
+    size_t pagesz = 4096;
+    size_t rounded = (sz + pagesz -1) & ~(pagesz-1);
+    if(madvise(&g_tls, rounded, MADV_DONTNEED)!=0) explicit_bzero(&g_tls, sz);
 }
 
 int main(int argc, char **argv) {
     (void)argv;
-    if (argc > 1) { eput("usage: transcriber (no flags; TRANSCRIBE_* env only)\n"); return 1; }
+    if(argc>1){ log_err("usage: transcriber (no flags; TRANSCRIBE_* env only)\n"); return 1; }
+
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_IGN);
-    key_init();
+    disable_core_dumps();
 
-    int tries = 0;
-    while (dns_resolve(g_host, &g_dst, &g_dstlen) != 0) {
-        if (++tries >= 3) { eput("transcriber: DNS resolve failed (phase 0): "); eput(g_host); eput("\n"); return 1; }
-        sleep_ms(2000);
+    config_load();
+
+    check_anchor_expiry();
+
+    if(dns_resolve_once(g_cfg.host)!=0){
+        log_err("transcriber: DNS resolve failed (phase 0): ");
+        log_err(g_cfg.host);
+        log_err("\n");
+        secure_wipe_cfg();
+        return 1;
     }
-    eput("transcriber: dns ok\n");
-    if (build_parts() != 0) die("provider config too long");
+    if(build_multipart_header()!=0) { secure_wipe_cfg(); fatal("provider config too long"); }
 
-    int pcm = mic_open();
-    int evfds[MAX_EVENTS];
-    int nev = ev_autoscan(evfds);
-    if (!nev) die("no key-capable event device found (need input group?)");
-    eput("transcriber: ready\n");
-    if (!on_path("xclip") || !on_path("xdotool")) eput("transcriber: no xclip/xdotool on PATH (paste will skip)\n");
+    int pcm_fd = mic_open();
 
-    struct pollfd pf[MAX_EVENTS];
-    poll_init(pf, evfds, nev);
+    int evfds[MAX_INPUT_DEVS];
+    int nev = input_scan(evfds, MAX_INPUT_DEVS);
+    if(nev==0){ secure_wipe_cfg(); fatal("no key-capable event device found (need input group?)"); }
 
-    for (;;) {
-        if (poll(pf, nev, -1) < 0) {
-            if (errno == EINTR) continue;
-            eput("transcriber: poll failed, retrying\n");
-            sleep_ms(1000);
+    tools_init();
+    if(!g_tools.xclip || !g_tools.xdotool)
+        log_err("transcriber: no xclip/xdotool on PATH (paste will fail)\n");
+
+    struct pollfd pf[MAX_INPUT_DEVS];
+    for(int i=0;i<nev;i++){ pf[i].fd=evfds[i]; pf[i].events=POLLIN; }
+
+    for(;;){
+        if(poll(pf,nev,-1)<0){
+            if(errno==EINTR) continue;
+            log_err("transcriber: poll failed, retrying\n");
+            struct timespec ts={1,0}; nanosleep(&ts,NULL);
             continue;
         }
-        for (int i = 0; i < nev; i++) {
-            if (pf[i].revents & (POLLERR|POLLHUP|POLLNVAL)) {
-                eput("transcriber: input device lost, rescanning\n");
+
+        for(int i=0;i<nev;i++){
+            if(pf[i].revents & (POLLERR|POLLHUP|POLLNVAL)){
+                log_err("transcriber: input device lost, rescanning\n");
                 close(evfds[i]);
-                for (int j = i; j + 1 < nev; j++) { evfds[j] = evfds[j+1]; pf[j] = pf[j+1]; }
-                nev--; i--; continue;
+                for(int j=i;j+1<nev;j++){ evfds[j]=evfds[j+1]; pf[j]=pf[j+1]; }
+                nev--; i--;
+                continue;
             }
-            if (!(pf[i].revents & POLLIN)) continue;
+            if(!(pf[i].revents & POLLIN)) continue;
+
             struct input_event ev;
-            while (read(evfds[i], &ev, sizeof ev) == sizeof ev) {
-                if (ev.type != EV_KEY || ev.code != g_keycode || ev.value == 2 || ev.value != 1) continue;
-                long long t = now_ms();
-                uint32_t wlen = 0;
-                int mfd = do_press(evfds, nev, pcm, t, &wlen);
-                if (mfd < 0) { session_drop(); continue; }
-                int rc = transmit(mfd, wlen);
-                if (rc > 0) {
-                    eput("transcriber: HTTP ");
-                    char b[16]; snprintf(b, sizeof b, "%03d", rc); write_all(2, b, strlen(b)); eput("\n");
-                } else if (rc != 0) eput("transcriber: send failed\n");
+            while(read(evfds[i],&ev,sizeof(ev))==sizeof(ev)){
+                if(ev.type!=EV_KEY || ev.code!=KEY_CODE || ev.value==2 || ev.value!=1) continue;
+                int64_t t0=now_ms();
+                uint32_t wlen=0;
+                int mfd=record_while_held(evfds,nev,pcm_fd,t0,&wlen);
+                if(mfd<0){
+                    tls_state_clear();
+                    continue;
+                }
+
+                int rc = http_transmit_once(mfd,wlen);
+                if(rc>0){
+                    log_err("transcriber: HTTP ");
+                    char b[16]; int n=snprintf(b,sizeof(b),"%03d",rc);
+                    if(n>0) write_all(STDERR_FILENO,b,strlen(b));
+                    log_err("\n");
+                } else if(rc!=0){
+                    log_err("transcriber: send failed (no retry in slim build)\n");
+                }
                 close(mfd);
-                session_drop();
+                tls_state_clear();
             }
         }
-        if (nev == 0) {
-            while ((nev = ev_autoscan(evfds)) == 0) sleep_ms(1000);
-            eput("transcriber: input recovered\n");
-            poll_init(pf, evfds, nev);
+
+        if(nev==0){
+            while((nev=input_scan(evfds,MAX_INPUT_DEVS))==0){
+                struct timespec ts={1,0}; nanosleep(&ts,NULL);
+            }
+            log_err("transcriber: input recovered\n");
+            for(int i=0;i<nev;i++){ pf[i].fd=evfds[i]; pf[i].events=POLLIN; }
         }
     }
 }
